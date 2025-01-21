@@ -6,7 +6,7 @@ export interface Row {
     timestamp: number;
 }
 
-export class Console {
+class Console {
     rows: Row[] = [];
 
     constructor() { }
@@ -14,8 +14,14 @@ export class Console {
     // TODO: support replacing substitution
     printLog = (rows: Row[], level: LogLevel, ...values: any) => {
         try {
+            const content = values.map(
+                (value: any) => {
+                    return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+                }
+            ).join(' ');
+
             const row = {
-                value: `${level}: ` + values.map((a: any) => JSON.stringify(a, null, 2)).join('\n'),
+                value: `${level}: ${content}`,
                 name: 'Text',
                 timestamp: Date.now(),
             };
@@ -65,4 +71,13 @@ export class Console {
         return this.rows
             .map(row => JSON.stringify(row) + '\n');
     };
+}
+
+let builtInConsole = new Console();
+export function getExistingConsole() {
+    return builtInConsole;
+}
+export function getNewConsole() {
+    builtInConsole = new Console();
+    return builtInConsole;
 }
