@@ -1,16 +1,15 @@
-/*
-* @jest-environment node
-*/
-import { describe, expect, it } from '@jest/globals';
 import fs from 'fs';
 import path from 'path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { convert } from '../convert';
 
 const fixturesPath = path.join(__dirname, './fixtures');
 const fixtures = fs.readdirSync(fixturesPath);
-
 describe('Fixtures', () => {
+  afterEach(() => {
+    vi.restoreAllMocks(); // Resets all mocks
+  });
   describe.each(fixtures)('Import %s', name => {
     const dir = path.join(fixturesPath, `./${name}`);
     const inputs = fs
@@ -19,27 +18,23 @@ describe('Fixtures', () => {
 
     for (const input of inputs) {
       const prefix = input.replace(/-input\.[^.]+/, '');
-      const output = `${prefix}-output.json`;
 
       if (prefix.startsWith('skip')) {
         continue;
       }
 
       it(input, async () => {
-        expect.assertions(5);
+        vi.spyOn(Date, 'now').mockImplementation(() => 1622117984000);
+
+        expect.assertions(3);
 
         expect(typeof input).toBe('string');
         const inputContents = fs.readFileSync(path.join(dir, input), 'utf8');
         expect(typeof inputContents).toBe('string');
 
-        expect(typeof output).toBe('string');
-        const outputContents = fs.readFileSync(path.join(dir, output), 'utf8');
-        expect(typeof outputContents).toBe('string');
-
         const results = await convert(inputContents);
-        const expected = JSON.parse(outputContents);
-        expected.__export_date = results.data.__export_date;
-        expect(results.data).toEqual(expected);
+        results.data.__export_date = '';
+        expect(results.data).toMatchSnapshot();
 
         const ids = new Set();
         for (const resource of results.data.resources) {

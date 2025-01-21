@@ -3,13 +3,13 @@ import orderedJSON from 'json-order';
 
 import * as models from '../models';
 import type { CookieJar } from '../models/cookie-jar';
-import type { Environment } from '../models/environment';
+import type { Environment, UserUploadEnvironment } from '../models/environment';
 import type { GrpcRequest, GrpcRequestBody } from '../models/grpc-request';
-import { isProject, Project } from '../models/project';
+import { isProject, type Project } from '../models/project';
 import { PATH_PARAMETER_REGEX, type Request } from '../models/request';
-import { isRequestGroup, RequestGroup } from '../models/request-group';
-import { WebSocketRequest } from '../models/websocket-request';
-import { isWorkspace, Workspace } from '../models/workspace';
+import { isRequestGroup, type RequestGroup } from '../models/request-group';
+import type { WebSocketRequest } from '../models/websocket-request';
+import { isWorkspace, type Workspace } from '../models/workspace';
 import * as templating from '../templating';
 import * as templatingUtils from '../templating/utils';
 import { setDefaultProtocol } from '../utils/url/protocol';
@@ -51,7 +51,7 @@ export interface RenderContextAndKeys {
   }[];
 }
 
-export type HandleGetRenderContext = () => Promise<RenderContextAndKeys>;
+export type HandleGetRenderContext = (contextCacheKey?: string) => Promise<RenderContextAndKeys>;
 
 export type HandleRender = <T>(object: T, contextCacheKey?: string | null) => Promise<T>;
 
@@ -60,15 +60,41 @@ export async function buildRenderContext(
     ancestors,
     rootEnvironment,
     subEnvironment,
+    rootGlobalEnvironment,
+    subGlobalEnvironment,
+    userUploadEnvironment,
+    transientVariables,
     baseContext = {},
   }: {
     ancestors?: RenderContextAncestor[];
     rootEnvironment?: Environment;
     subEnvironment?: Environment;
+      rootGlobalEnvironment?: Environment | null;
+      subGlobalEnvironment?: Environment | null;
+      userUploadEnvironment?: UserUploadEnvironment;
+      transientVariables?: Environment;
     baseContext?: Record<string, any>;
   },
 ) {
   const envObjects: Record<string, any>[] = [];
+
+  if (rootGlobalEnvironment) {
+    const ordered = orderedJSON.order(
+      rootGlobalEnvironment.data,
+      rootGlobalEnvironment.dataPropertyOrder,
+      JSON_ORDER_SEPARATOR,
+    );
+    envObjects.push(ordered);
+  }
+
+  if (subGlobalEnvironment) {
+    const ordered = orderedJSON.order(
+      subGlobalEnvironment.data,
+      subGlobalEnvironment.dataPropertyOrder,
+      JSON_ORDER_SEPARATOR,
+    );
+    envObjects.push(ordered);
+  }
 
   // Get root environment keys in correct order
   // Then get sub environment keys in correct order
@@ -103,6 +129,26 @@ export async function buildRenderContext(
       );
       envObjects.push(ordered);
     }
+  }
+
+  // user upload env in collection runner has highest priority except local variables
+  if (userUploadEnvironment) {
+    const ordered = orderedJSON.order(
+      userUploadEnvironment.data,
+      userUploadEnvironment.dataPropertyOrder,
+      JSON_ORDER_SEPARATOR,
+    );
+    envObjects.push(ordered);
+  }
+
+  // script local variables (insomnia.variable.set) has highest priority
+  if (transientVariables) {
+    const ordered = orderedJSON.order(
+      transientVariables.data,
+      transientVariables.dataPropertyOrder,
+      JSON_ORDER_SEPARATOR,
+    );
+    envObjects.push(ordered);
   }
 
   // At this point, environments is a list of environments ordered
@@ -219,9 +265,12 @@ export async function render<T>(
   blacklistPathRegex: RegExp | null = null,
   errorMode: string = THROW_ON_ERROR,
   name = '',
+  ignoreUndefinedEnvVariable: boolean = false,
 ) {
   // Make a deep copy so no one gets mad :)
   const newObj = clone(obj);
+
+  const undefinedEnvironmentVariables: string[] = [];
 
   async function next<T>(x: T, path: string, first = false) {
     if (blacklistPathRegex && path.match(blacklistPathRegex)) {
@@ -244,7 +293,7 @@ export async function render<T>(
     } else if (typeof x === 'string') {
       try {
         // @ts-expect-error -- TSCONVERSION
-        x = await templating.render(x, { context, path });
+        x = await templating.render(x, { context, path, ignoreUndefinedEnvVariable });
 
         // If the variable outputs a tag, render it again. This is a common use
         // case for environment variables:
@@ -257,7 +306,11 @@ export async function render<T>(
       } catch (err) {
         console.log(`Failed to render element ${path}`, x);
         if (errorMode !== KEEP_ON_ERROR) {
-          throw err;
+          if (err?.extraInfo?.subType === templating.RenderErrorSubType.EnvironmentVariable) {
+            undefinedEnvironmentVariables.push(...err.extraInfo.undefinedEnvironmentVariables);
+          } else {
+            throw err;
+          }
         }
       }
     } else if (Array.isArray(x)) {
@@ -289,7 +342,18 @@ export async function render<T>(
     return x;
   }
 
-  return next<T>(newObj, name, true);
+  const renderResult = await next<T>(newObj, name, true);
+  if (undefinedEnvironmentVariables.length > 0) {
+    const error = new templating.RenderError(`Failed to render environment variables: ${undefinedEnvironmentVariables.join(', ')}`);
+    error.type = 'render';
+    error.extraInfo = {
+      subType: templating.RenderErrorSubType.EnvironmentVariable,
+      undefinedEnvironmentVariables,
+    };
+    throw error;
+  }
+
+  return renderResult;
 }
 
 interface RenderRequest<T extends Request | GrpcRequest | WebSocketRequest> {
@@ -297,9 +361,15 @@ interface RenderRequest<T extends Request | GrpcRequest | WebSocketRequest> {
 }
 
 interface BaseRenderContextOptions {
-  environmentId?: string;
+  environment?: string | Environment;
+  baseEnvironment?: Environment;
+  rootGlobalEnvironment?: Environment;
+  subGlobalEnvironment?: Environment;
+  userUploadEnvironment?: UserUploadEnvironment;
+  transientVariables?: Environment;
   purpose?: RenderPurpose;
   extraInfo?: ExtraRenderInfo;
+  ignoreUndefinedEnvVariable?: boolean;
 }
 
 interface RenderContextOptions extends BaseRenderContextOptions, Partial<RenderRequest<Request | GrpcRequest | WebSocketRequest>> {
@@ -308,7 +378,10 @@ interface RenderContextOptions extends BaseRenderContextOptions, Partial<RenderR
 export async function getRenderContext(
   {
     request,
-    environmentId,
+    environment,
+    baseEnvironment,
+    userUploadEnvironment,
+    transientVariables,
     ancestors: _ancestors,
     purpose,
     extraInfo,
@@ -322,12 +395,40 @@ export async function getRenderContext(
     throw new Error('Failed to render. Could not find workspace');
   }
 
-  const rootEnvironment = await models.environment.getOrCreateForParentId(
+  const workspaceMeta = await models.workspaceMeta.getByParentId(workspace._id);
+
+  let rootGlobalEnvironment: Environment | null = null;
+  let subGlobalEnvironment: Environment | null = null;
+
+  if (workspaceMeta?.activeGlobalEnvironmentId) {
+    const activeGlobalEnvironment = await models.environment.getById(workspaceMeta.activeGlobalEnvironmentId);
+
+    if (activeGlobalEnvironment) {
+      if (activeGlobalEnvironment?.parentId.startsWith('wrk_')) {
+        rootGlobalEnvironment = activeGlobalEnvironment;
+      } else {
+        subGlobalEnvironment = activeGlobalEnvironment;
+
+        const baseGlobalEnvironment = await models.environment.getById(activeGlobalEnvironment.parentId);
+
+        if (baseGlobalEnvironment) {
+          rootGlobalEnvironment = baseGlobalEnvironment;
+        }
+      }
+    }
+  }
+
+  const rootEnvironment = baseEnvironment || await models.environment.getOrCreateForParentId(
     workspace ? workspace._id : 'n/a',
   );
-  const subEnvironment = await models.environment.getById(environmentId || 'n/a');
-  const keySource: Record<string, string> = {};
+  const subEnvironmentId = environment ?
+    typeof environment === 'string' ? environment : environment._id :
+    'n/a';
+  const subEnvironment = environment ?
+    typeof environment === 'string' ? await models.environment.getById(environment) : environment :
+    await models.environment.getById('n/a');
 
+  const keySource: Record<string, string> = {};
   // Function that gets Keys and stores their Source location
   function getKeySource(subObject: string | Record<string, any>, inKey: string, inSource: string) {
     // Add key to map if it's not root
@@ -352,6 +453,15 @@ export async function getRenderContext(
   }
 
   const inKey = templating.NUNJUCKS_TEMPLATE_GLOBAL_PROPERTY_NAME;
+
+  if (rootGlobalEnvironment) {
+    getKeySource(rootGlobalEnvironment.data || {}, inKey, 'rootGlobal');
+  }
+
+  if (subGlobalEnvironment) {
+    getKeySource(subGlobalEnvironment.data || {}, inKey, 'subGlobal');
+  }
+
   // Get Keys from root environment
   getKeySource((rootEnvironment || {}).data, inKey, 'root');
 
@@ -375,6 +485,15 @@ export async function getRenderContext(
     }
   }
 
+  // Get Keys from user upload environment
+  if (userUploadEnvironment) {
+    getKeySource(userUploadEnvironment.data || {}, inKey, userUploadEnvironment.name || 'uploadData');
+  }
+
+  if (transientVariables) {
+    getKeySource(transientVariables.data || {}, inKey, transientVariables.name || 'scriptLocalVariables');
+  }
+
   // Add meta data helper function
   const baseContext: BaseRenderContext = {
     getMeta: () => ({
@@ -393,13 +512,23 @@ export async function getRenderContext(
       const p = extraInfo.find(v => v.name === key);
       return p ? p.value : null;
     },
-    getEnvironmentId: () => environmentId,
-    // It is possible for a project to not exist because this code path can be reached via Inso/insomnia-send-request which has no concept of a project.
+    getEnvironmentId: () => subEnvironmentId,
+    getGlobalEnvironmentId: () => subGlobalEnvironment?._id || rootGlobalEnvironment?._id,
+    // It is possible for a project to not exist because this code path can be reached via Inso which has no concept of a project.
     getProjectId: () => project?._id,
   };
 
   // Generate the context we need to render
-  return buildRenderContext({ ancestors, rootEnvironment, subEnvironment: subEnvironment || undefined, baseContext });
+  return buildRenderContext({
+    ancestors,
+    rootGlobalEnvironment,
+    subGlobalEnvironment,
+    rootEnvironment,
+    subEnvironment: subEnvironment || undefined,
+    userUploadEnvironment,
+    transientVariables,
+    baseContext,
+  });
 }
 interface BaseRenderContext {
   getMeta: () => {};
@@ -407,6 +536,7 @@ interface BaseRenderContext {
   getPurpose: () => string | undefined;
   getExtraInfo: (key: string) => string | null;
   getEnvironmentId: () => string | undefined;
+  getGlobalEnvironmentId: () => string | undefined;
   getProjectId: () => string | undefined;
 }
 interface RenderGrpcRequestOptions extends BaseRenderContextOptions, RenderRequest<GrpcRequest> {
@@ -417,11 +547,11 @@ export async function getRenderedGrpcRequest(
     purpose,
     extraInfo,
     request,
-    environmentId,
+    environment,
     skipBody,
   }: RenderGrpcRequestOptions,
 ) {
-  const renderContext = await getRenderContext({ request, environmentId, purpose, extraInfo });
+  const renderContext = await getRenderContext({ request, environment, purpose, extraInfo });
   const description = request.description;
   // Render description separately because it's lower priority
   request.description = '';
@@ -440,13 +570,13 @@ export async function getRenderedGrpcRequest(
 type RenderGrpcRequestMessageOptions = BaseRenderContextOptions & RenderRequest<GrpcRequest>;
 export async function getRenderedGrpcRequestMessage(
   {
-    environmentId,
+    environment,
     request,
     extraInfo,
     purpose,
   }: RenderGrpcRequestMessageOptions,
 ) {
-  const renderContext = await getRenderContext({ request, environmentId, purpose, extraInfo });
+  const renderContext = await getRenderContext({ request, environment, purpose, extraInfo });
   // Render request body
   const renderedBody: RenderedGrpcRequestBody = await render(request.body, renderContext);
   return renderedBody;
@@ -460,16 +590,20 @@ export interface RequestAndContext {
 export async function getRenderedRequestAndContext(
   {
     request,
-    environmentId,
+    environment,
+    baseEnvironment,
+    userUploadEnvironment,
+    transientVariables,
     extraInfo,
     purpose,
+    ignoreUndefinedEnvVariable,
   }: RenderRequestOptions,
 ): Promise<RequestAndContext> {
   const ancestors = await getRenderContextAncestors(request);
   const workspace = ancestors.find(isWorkspace);
   const parentId = workspace ? workspace._id : 'n/a';
   const cookieJar = await models.cookieJar.getOrCreateForParentId(parentId);
-  const renderContext = await getRenderContext({ request, environmentId, ancestors, purpose, extraInfo });
+  const renderContext = await getRenderContext({ request, environment, ancestors, purpose, extraInfo, baseEnvironment, userUploadEnvironment, transientVariables });
 
   // HACK: Switch '#}' to '# }' to prevent Nunjucks from barfing
   // https://github.com/kong/insomnia/issues/895
@@ -492,12 +626,18 @@ export async function getRenderedRequestAndContext(
     },
     renderContext,
     request.settingDisableRenderRequestBody ? /^body.*/ : null,
+    THROW_ON_ERROR,
+    '',
+    ignoreUndefinedEnvVariable,
   );
 
   const renderedRequest = renderResult._request;
   const renderedCookieJar = renderResult._cookieJar;
   renderedRequest.description = await render(description, renderContext, null, KEEP_ON_ERROR);
-  const suppressUserAgent = request.headers.some(h => h.name.toLowerCase() === 'user-agent' && h.disabled === true);
+  const userAgentHeaders = request.headers.filter(h => h.name.toLowerCase() === 'user-agent');
+  const noUserAgents = userAgentHeaders.length === 0;
+  const allUserAgentHeadersDisabled = userAgentHeaders.every(h => h.disabled === true);
+  const suppressUserAgent = noUserAgents || allUserAgentHeadersDisabled;
   // Remove disabled params
   renderedRequest.parameters = renderedRequest.parameters.filter(p => !p.disabled);
   // Remove disabled headers
@@ -509,7 +649,7 @@ export async function getRenderedRequestAndContext(
   }
 
   // Remove disabled authentication
-  if (renderedRequest.authentication && renderedRequest.authentication.disabled) {
+  if (renderedRequest.authentication && 'disabled' in renderedRequest.authentication && renderedRequest.authentication.disabled) {
     renderedRequest.authentication = {};
   }
 
@@ -561,6 +701,8 @@ export async function getRenderedRequestAndContext(
       settingFollowRedirects: renderedRequest.settingFollowRedirects,
       type: renderedRequest.type,
       url: renderedRequest.url,
+      preRequestScript: renderedRequest.preRequestScript,
+      afterResponseScript: renderedRequest.afterResponseScript,
     },
   };
 }

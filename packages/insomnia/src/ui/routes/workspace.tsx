@@ -1,32 +1,32 @@
-import React from 'react';
-import { LoaderFunction, Outlet } from 'react-router-dom';
+import React, { useEffect } from 'react';
+import { type LoaderFunction, Outlet, useLoaderData } from 'react-router-dom';
 
-import { isLoggedIn } from '../../account/session';
-import { SortOrder } from '../../common/constants';
+import type { SortOrder } from '../../common/constants';
 import { database } from '../../common/database';
 import { fuzzyMatchAll } from '../../common/misc';
+import { LandingPage } from '../../common/sentry';
 import { sortMethodMap } from '../../common/sorting';
 import * as models from '../../models';
-import { ApiSpec } from '../../models/api-spec';
-import { CaCertificate } from '../../models/ca-certificate';
-import { ClientCertificate } from '../../models/client-certificate';
-import { CookieJar } from '../../models/cookie-jar';
-import { Environment } from '../../models/environment';
-import { GitRepository } from '../../models/git-repository';
-import { GrpcRequest } from '../../models/grpc-request';
-import { GrpcRequestMeta } from '../../models/grpc-request-meta';
+import type { ApiSpec } from '../../models/api-spec';
+import type { CaCertificate } from '../../models/ca-certificate';
+import type { ClientCertificate } from '../../models/client-certificate';
+import type { CookieJar } from '../../models/cookie-jar';
+import type { Environment } from '../../models/environment';
+import type { GitRepository } from '../../models/git-repository';
+import type { GrpcRequest } from '../../models/grpc-request';
+import type { GrpcRequestMeta } from '../../models/grpc-request-meta';
 import { sortProjects } from '../../models/helpers/project';
-import { MockServer } from '../../models/mock-server';
-import { Project } from '../../models/project';
-import { Request } from '../../models/request';
-import { isRequestGroup, RequestGroup } from '../../models/request-group';
-import { RequestGroupMeta } from '../../models/request-group-meta';
-import { RequestMeta } from '../../models/request-meta';
-import {
+import type { MockServer } from '../../models/mock-server';
+import type { Project } from '../../models/project';
+import type { Request } from '../../models/request';
+import { isRequestGroup, type RequestGroup } from '../../models/request-group';
+import type { RequestGroupMeta } from '../../models/request-group-meta';
+import type { RequestMeta } from '../../models/request-meta';
+import type {
   WebSocketRequest,
 } from '../../models/websocket-request';
-import { Workspace } from '../../models/workspace';
-import { WorkspaceMeta } from '../../models/workspace-meta';
+import type { Workspace } from '../../models/workspace';
+import type { WorkspaceMeta } from '../../models/workspace-meta';
 import { pushSnapshotOnInitialize } from '../../sync/vcs/initialize-backend-project';
 import { VCSInstance } from '../../sync/vcs/insomnia-sync';
 import { invariant } from '../../utils/invariant';
@@ -40,11 +40,14 @@ export interface WorkspaceLoaderData {
   activeProject: Project;
   gitRepository: GitRepository | null;
   activeEnvironment: Environment;
+  activeGlobalEnvironment?: Environment | null;
   activeCookieJar: CookieJar;
   baseEnvironment: Environment;
   subEnvironments: Environment[];
+  globalBaseEnvironments: (Environment & { workspaceName: string })[];
+  globalSubEnvironments: Environment[];
   activeApiSpec: ApiSpec | null;
-  activeMockServer: MockServer | null;
+  activeMockServer?: MockServer | null;
   clientCertificates: ClientCertificate[];
   caCertificate: CaCertificate | null;
   projects: Project[];
@@ -97,10 +100,38 @@ export const workspaceLoader: LoaderFunction = async ({
     await models.environment.findByParentId(baseEnvironment._id)
   ).sort((e1, e2) => e1.metaSortKey - e2.metaSortKey);
 
-  const activeEnvironment =
-    subEnvironments.find(
-      ({ _id }) => activeWorkspaceMeta.activeEnvironmentId === _id,
-    ) || baseEnvironment;
+  const globalEnvironmentWorkspaces = await database.find<Workspace>(models.workspace.type, {
+    parentId: projectId,
+    scope: 'environment',
+  });
+
+  const globalBaseEnvironments = await database.find<Environment>(models.environment.type, {
+    parentId: {
+      $in: globalEnvironmentWorkspaces.map(w => w._id),
+    },
+  });
+
+  const globalSubEnvironments = await database.find<Environment>(models.environment.type, {
+    parentId: {
+      $in: globalBaseEnvironments.map(e => e._id),
+    },
+  });
+
+  const globalBaseEnvironmentsWithWorkspaceName = globalBaseEnvironments.map(e => {
+    const workspace = globalEnvironmentWorkspaces.find(w => w._id === e.parentId);
+    return {
+      ...e,
+      workspaceName: workspace?.name || '',
+    };
+  });
+
+  const activeEnvironment = (await database.getWhere<Environment>(models.environment.type, {
+    _id: activeWorkspaceMeta.activeEnvironmentId,
+  })) || baseEnvironment;
+
+  const activeGlobalEnvironment = (await database.getWhere<Environment>(models.environment.type, {
+    _id: activeWorkspaceMeta.activeGlobalEnvironmentId,
+  }));
 
   const activeCookieJar = await models.cookieJar.getOrCreateForParentId(
     workspaceId,
@@ -145,7 +176,6 @@ export const workspaceLoader: LoaderFunction = async ({
   const grpcRequestMetas = await database.find(models.grpcRequestMeta.type, { parentId: { $in: grpcReqs.map(r => r._id) } });
   const grpcAndRequestMetas = [...requestMetas, ...grpcRequestMetas] as (RequestMeta | GrpcRequestMeta)[];
   const requestGroupMetas = await database.find(models.requestGroupMeta.type, { parentId: { $in: listOfParentIds } }) as RequestGroupMeta[];
-
   // second recursion to build the tree
   const getCollectionTree = async ({
     parentId,
@@ -203,6 +233,7 @@ export const workspaceLoader: LoaderFunction = async ({
 
     return childrenWithChildren;
   };
+
   const requestTree = await getCollectionTree({
     parentId: activeWorkspace._id,
     level: 0,
@@ -227,7 +258,8 @@ export const workspaceLoader: LoaderFunction = async ({
     return collection;
   }
 
-  if (isLoggedIn() && !gitRepository) {
+  const userSession = await models.userSession.getOrCreate();
+  if (userSession.id && !gitRepository) {
     try {
       const vcs = VCSInstance();
       await vcs.switchAndCreateBackendProjectIfNotExist(workspaceId, activeWorkspace.name);
@@ -266,8 +298,11 @@ export const workspaceLoader: LoaderFunction = async ({
     activeWorkspaceMeta,
     activeCookieJar,
     activeEnvironment,
+    activeGlobalEnvironment,
     subEnvironments,
     baseEnvironment,
+    globalSubEnvironments,
+    globalBaseEnvironments: globalBaseEnvironmentsWithWorkspaceName,
     activeApiSpec,
     activeMockServer,
     clientCertificates,
@@ -281,6 +316,13 @@ export const workspaceLoader: LoaderFunction = async ({
 };
 
 const WorkspaceRoute = () => {
+  const { activeWorkspace } = useLoaderData() as WorkspaceLoaderData;
+
+  useEffect(() => {
+    const { scope } = activeWorkspace;
+    window.main.landingPageRendered(LandingPage.Workspace, { scope });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   return <Outlet />;
 };
 

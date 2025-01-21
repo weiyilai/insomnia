@@ -1,91 +1,75 @@
-import React from 'react';
+import type { IconName } from '@fortawesome/fontawesome-svg-core';
+import React, { useEffect } from 'react';
 import { Link, Route, Routes, useLocation } from 'react-router-dom';
 
+import { LandingPage } from '../../common/sentry';
 import { InsomniaLogo } from '../components/insomnia-icon';
 import { TrailLinesContainer } from '../components/trail-lines-container';
-import collaborators_rbac from '../images/onboarding/collaborators_rbac.png';
-import insomnia_ai from '../images/onboarding/insomnia_ai.png';
-import introducing_organizations from '../images/onboarding/introducing_organizations.png';
-import new_cloud_dashboard from '../images/onboarding/new_cloud_dashboard.png';
-import real_time_collaboration from '../images/onboarding/real_time_collaboration.png';
-import sharing_projects from '../images/onboarding/sharing_projects.png';
-import social_and_enterprise_sso from '../images/onboarding/social_and_enterprise_sso.png';
-import sse_api_support from '../images/onboarding/sse_api_support.png';
-import unlimited_projects from '../images/onboarding/unlimited_projects.png';
+import collection_runner from '../images/onboarding/collection_runner.png';
+import co_owner from '../images/onboarding/coowner.png';
+import invite_control from '../images/onboarding/invite_control.png';
+import offline_experience from '../images/onboarding/offline_experience.png';
+import test_results from '../images/onboarding/test_results.png';
+import uncommitted_changes from '../images/onboarding/uncommited_changes.png';
 
 const features = [
   {
-    id: 'sharing_projects',
-    icon: 'code-fork',
-    title: 'Sharing Projects',
+    id: 'collection_runner',
+    icon: 'circle-play',
+    title: 'New Collection Runner',
     description:
-      'We have entirely reinvented sharing and collaboration in Insomnia. It is now easy and quick to invite as many collaborators as we want to join our projects, collections or design documents.',
-    image: sharing_projects,
+      'You can run tests for an entire collection using the new Collection Runner! And it\'s unlimited for every Insomnia user.',
+    image: collection_runner,
   },
   {
-    id: 'real_time_collaboration',
-    icon: 'users',
-    title: 'Real time collaboration',
+    id: 'test_results',
+    icon: 'square-poll-vertical',
+    title: 'Test Results',
     description:
-      'With the new real time collaboration features, you can be more productive, reduce team coordination and always know in real time who is working with you on the same collections or design documents.',
-    image: real_time_collaboration,
+      'In the previous v9.x we introduced full scripting support, and now we are introducing the ability to visualize test results when executing a request.',
+    image: test_results,
   },
   {
-    id: 'introducing_organizations',
-    icon: 'city',
-    title: 'Introducing Organizations',
+    id: 'invite_control',
+    icon: 'lock',
+    title: 'Invite Control',
     description:
-      'Teams have been replaced with Organizations, you can now create as many as you need and invite people to collaborate with them.',
-    image: introducing_organizations,
+      'With this enterprise capability you can create invite rules to determine what domains can be invited to join an organization.',
+    image: invite_control,
+    rounded: true,
   },
   {
-    id: 'social_and_enterprise_sso',
-    icon: 'user-circle',
-    title: 'Social and Enterprise SSO',
-    description: `Organizations now support EE SSO via SAML and OIDC, while other accounts can login via social SSO providers like Google or GitHub,
-    in addition to the traditional email login.`,
-    image: social_and_enterprise_sso,
+    id: 'unpushed_notifications',
+    icon: 'bell',
+    title: 'Unpushed notifications',
+    description: 'You can now see indicators for changes that have not been committed - or have not been pushed - inside your projects and files.',
+    image: uncommitted_changes,
   },
   {
-    id: 'sse_api_support',
-    icon: 'plug',
-    title: 'Server Side Events API Support',
+    id: 'offline_experience',
+    icon: 'wifi',
+    title: 'Offline experience',
     description:
-      'Server Side Events APIs are now supported to give you even more ways to debug APIs with Insomnia, in addition to the previously supported REST, GraphQL, gRPC and WebSockets.',
-    image: sse_api_support,
+      'In the previous Insomnia v9.x we significantly improved the performance of the application, and in this one are making the offline experience even better.',
+    image: offline_experience,
   },
   {
-    id: 'insomnia_ai',
-    icon: 'robot',
-    title: 'Insomnia AI',
+    id: 'multiple_owners',
+    icon: 'user-group',
+    title: 'Multiple owners',
     description:
-      'With Insomnia Al you can auto-generate API tests based on an OpenAPI specification that you create. Build more reliable APIs and save on development time.',
-    image: insomnia_ai,
+      'With this enterprise feature, we are finally introducing the ability to have multiple co-owners for an enterprise organization account.',
+    image: co_owner,
+    rounded: true,
   },
-  {
-    id: 'new_cloud_dashboard',
-    icon: 'cloud',
-    title: 'New cloud dashboard',
-    description: 'With an entirely redesigned cloud platform and dashboard at insomnia.rest managing all of your organizations and collaborators is a piece of cake.',
-    image: new_cloud_dashboard,
-  },
-  {
-    id: 'collaborators_rbac',
-    icon: 'user-friends',
-    title: 'Collaborators RBAC',
-    description:
-      'Inviting users to your personal workspace or organization just got more powerful and intuitive with powerful RBAC rules to determine the level of access.',
-    image: collaborators_rbac,
-  },
-  {
-    id: 'unlimited_projects',
-    icon: 'infinity',
-    title: 'Unlimited Projects',
-    description:
-      'We removed all limitations to the Insomnia application, you can now create as many projects as you want, with as many files as you want.',
-    image: unlimited_projects,
-  },
-];
+] satisfies {
+  id: string;
+  icon: IconName;
+  title: string;
+  description: string;
+  image: string;
+  rounded?: boolean;
+}[];
 
 const FeatureWizardView = () => {
   return (
@@ -93,15 +77,15 @@ const FeatureWizardView = () => {
       <Route
         path="/"
         element={
-          <ul className="grid grid-cols-3 gap-2 h-80 justify-center p-4">
+          <ul className="grid grid-cols-3 gap-2 justify-center p-4">
             {features.map(feature => (
               <li key={feature.id}>
                 <Link
-                  className="w-full hover:bg-[--hl-sm] bg-[--hl-xs] transition-colors select-none h-24 border-solid flex flex-col items-center justify-center text-xs border border-[--hl-md] rounded-sm p-4 gap-2 hover:no-underline"
+                  className="w-full hover:bg-[--hl-sm] bg-[--hl-xs] transition-colors select-none h-32 border-solid flex flex-col items-center justify-center border border-[--hl-md] rounded-sm p-4 gap-2 hover:no-underline"
                   to={`/onboarding/${feature.id}`}
                 >
-                  <i className={`fa fa-${feature.icon} text-lg`} />
-                  <span className="text-center">{feature.title}</span>
+                  <i className={`fa fa-${feature.icon} text-xl`} />
+                  <span className="text-center text-sm">{feature.title}</span>
                 </Link>
               </li>
             ))}
@@ -135,7 +119,10 @@ const FeatureWizardView = () => {
                       <span>{feature.description}</span>
                     </p>
                     <div className="h-32">
-                      <img className="max-h-32 aspect-auto" src={feature.image} />
+                      {feature.rounded ? (
+                        <img className="max-h-32 aspect-auto rounded-md" src={feature.image} />) : (
+                          <img className="max-h-32 aspect-auto" src={feature.image} />
+                      )}
                     </div>
                     <div className="flex w-full p-4 bottom-0 left-0 sticky justify-between text-sm font-normal bg-gradient-to-t from-[--color-bg] to-[rgba(var(--color-bg-rgb),80%)]">
                       {prevPath ? (
@@ -170,23 +157,26 @@ const FeatureWizardView = () => {
 const Onboarding = () => {
   const location = useLocation();
 
+  useEffect(() => {
+    window.main.landingPageRendered(LandingPage.Onboarding);
+  }, []);
+
   return (
     <div className="relative h-full w-full text-left flex bg-[--color-bg]">
       <TrailLinesContainer>
-        <div className="flex justify-center items-center flex-col h-full w-[600px] min-h-[450px]">
-          <div className="flex flex-col gap-[var(--padding-sm)] items-center justify-center p-[--padding-lg] pt-12 w-full h-full bg-[--hl-xs] rounded-[var(--radius-md)] border-solid border border-[--hl-sm] relative">
+        <div className="flex justify-center items-center flex-col h-full w-[600px] min-h-[465px]">
+          <div className="flex flex-col gap-[var(--padding-sm)] items-center h-[465px] justify-center p-[--padding-lg] pt-12 w-full bg-[--hl-xs] rounded-[var(--radius-md)] border-solid border border-[--hl-sm] relative">
             <InsomniaLogo className="transform translate-x-[-50%] translate-y-[-50%] absolute top-0 left-1/2 w-16 h-16" />
-            <div className="text-[--color-font] flex flex-col gap-6">
+            <div className="text-[--color-font] flex flex-col gap-6 h-full">
               <h1 className="text-xl text-center">
-                🚀 Welcome to Insomnia 8!
+                🚀 Welcome to Insomnia 10!
               </h1>
               <div>
                 <p>
-                  This new version is the biggest one ever! Notable features
-                  are:
+                  We shipped hundreds of improvements including the following notable features:
                 </p>
               </div>
-              <div className="w-full relative min-h-full">
+              <div className="w-full relative flex-1">
                 <FeatureWizardView />
               </div>
               <div className="flex justify-between items-center">
@@ -202,9 +192,9 @@ const Onboarding = () => {
                   <span />
                 )}
                 <Link
-                  className="hover:no-underline bg-[--color-surprise] text-sm hover:bg-opacity-90 border border-solid border-[--hl-md] py-2 px-3 text-[--color-font] transition-colors rounded-sm"
-                  to="/onboarding/migrate"
-                  onClick={() => window.localStorage.setItem('hasSeenOnboarding', 'true')}
+                  className="hover:no-underline bg-[--color-surprise] text-sm hover:bg-opacity-90 border border-solid border-[--hl-md] py-2 px-3 text-[--color-font-surprise] transition-colors rounded-sm"
+                  to={window.localStorage.getItem('prefers-project-type') ? '/organization' : '/onboarding/migrate'}
+                  onClick={() => window.localStorage.setItem('hasSeenOnboardingV10', 'true')}
                 >
                   Continue
                 </Link>

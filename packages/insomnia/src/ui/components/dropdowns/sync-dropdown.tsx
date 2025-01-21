@@ -1,5 +1,5 @@
-import { IconProp } from '@fortawesome/fontawesome-svg-core';
-import React, { FC, Fragment, useEffect, useState } from 'react';
+import type { IconProp } from '@fortawesome/fontawesome-svg-core';
+import React, { type FC, Fragment, useCallback, useEffect, useState } from 'react';
 import { Button, Collection, Menu, MenuItem, MenuTrigger, Popover, Section, Tooltip, TooltipTrigger } from 'react-aria-components';
 import { useFetcher, useParams } from 'react-router-dom';
 import { useInterval } from 'react-use';
@@ -7,10 +7,11 @@ import { useInterval } from 'react-use';
 import * as session from '../../../account/session';
 import { getAppWebsiteBaseURL } from '../../../common/constants';
 import { isOwnerOfOrganization } from '../../../models/organization';
-import { Project } from '../../../models/project';
+import type { Project } from '../../../models/project';
 import type { Workspace } from '../../../models/workspace';
 import { useOrganizationLoaderData } from '../../routes/organization';
-import { SyncDataLoaderData } from '../../routes/remote-collections';
+import type { SyncDataLoaderData } from '../../routes/remote-collections';
+import { useRootLoaderData } from '../../routes/root';
 import { Icon } from '../icon';
 import { showError, showModal } from '../modals';
 import { AlertModal } from '../modals/alert-modal';
@@ -31,11 +32,13 @@ const ONE_MINUTE_IN_MS = 1000 * 60;
 export const SyncDropdown: FC<Props> = ({ gitSyncEnabled }) => {
   const { organizationId, projectId, workspaceId } = useParams<{ organizationId: string; projectId: string; workspaceId: string }>();
   const { organizations } = useOrganizationLoaderData();
+  const { userSession } = useRootLoaderData();
   const currentOrg = organizations.find(organization => (organization.id === organizationId));
   const [isGitRepoSettingsModalOpen, setIsGitRepoSettingsModalOpen] = useState(false);
   const [isSyncHistoryModalOpen, setIsSyncHistoryModalOpen] = useState(false);
   const [isSyncStagingModalOpen, setIsSyncStagingModalOpen] = useState(false);
   const [isSyncBranchesModalOpen, setIsSyncBranchesModalOpen] = useState(false);
+  const [isWindowFocused, setIsWindowFocused] = useState(true);
 
   const pushFetcher = useFetcher();
   const pullFetcher = useFetcher();
@@ -50,12 +53,31 @@ export const SyncDropdown: FC<Props> = ({ gitSyncEnabled }) => {
     }
   }, [organizationId, projectId, syncDataLoaderFetcher, workspaceId]);
 
-  useInterval(() => {
-    syncDataActionFetcher.submit({}, {
+  const triggerSync = useCallback(() => {
+    const submit = syncDataActionFetcher.submit;
+    submit({}, {
       method: 'POST',
       action: `/organization/${organizationId}/project/${projectId}/workspace/${workspaceId}/insomnia-sync/sync-data`,
     });
-  }, ONE_MINUTE_IN_MS);
+  }, [organizationId, projectId, syncDataActionFetcher.submit, workspaceId]);
+
+  useEffect(() => {
+    const unsubscribe = window.main.on('mainWindowFocusChange', (_, isFocus) => {
+      setIsWindowFocused(isFocus);
+      if (isFocus) {
+        // trigger sync when user comes back to the app
+        triggerSync();
+      }
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, [triggerSync]);
+
+  useInterval(() => {
+    triggerSync();
+  }, isWindowFocused ? ONE_MINUTE_IN_MS : null);
 
   const error = checkoutFetcher.data?.error || pullFetcher.data?.error || pushFetcher.data?.error || rollbackFetcher.data?.error;
 
@@ -88,7 +110,6 @@ export const SyncDropdown: FC<Props> = ({ gitSyncEnabled }) => {
     historyCount: 0,
     history: [],
     syncItems: [],
-    remoteBackendProjects: [],
     compare: { ahead: 0, behind: 0 },
   };
 
@@ -148,7 +169,7 @@ export const SyncDropdown: FC<Props> = ({ gitSyncEnabled }) => {
     }
     const isOwner = isOwnerOfOrganization({
       organization: currentOrg,
-      accountId,
+      accountId: userSession.accountId,
     });
 
     isOwner ?
@@ -255,10 +276,10 @@ export const SyncDropdown: FC<Props> = ({ gitSyncEnabled }) => {
   return (
     <Fragment>
       <MenuTrigger>
-        <div className="flex items-center h-9 gap-4 px-[--padding-md] w-full aria-pressed:bg-[--hl-sm] rounded-sm text-[--color-font] hover:bg-[--hl-xs] focus:ring-inset ring-1 ring-transparent focus:ring-[--hl-md] transition-all text-sm">
+        <div className="flex items-center h-[--line-height-sm] w-full aria-pressed:bg-[--hl-sm] text-[--color-font] hover:bg-[--hl-xs] focus:ring-inset ring-1 ring-transparent focus:ring-[--hl-md] transition-all text-sm">
           <Button
             aria-label="Insomnia Sync"
-            className="flex-1 flex items-center gap-2 truncate"
+            className="flex-1 flex h-full items-center gap-2 truncate px-[--padding-md]"
           >
             <Icon
               icon={syncError ? 'warning' : isSyncing ? 'refresh' : 'cloud'}
@@ -266,9 +287,9 @@ export const SyncDropdown: FC<Props> = ({ gitSyncEnabled }) => {
             />
             <span className={`truncate ${syncError ? 'text-[--color-warning]' : ''}`}>{syncError ? 'Error syncing with Insomnia Cloud' : currentBranch}</span>
           </Button>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center h-full">
             <TooltipTrigger>
-              <Button>
+              <Button className="h-full pl-2">
                 <Icon icon="cube" className={`transition-colors ${canCreateSnapshot ? 'text-[--color-warning]' : 'opacity-50'}`} />
               </Button>
               <Tooltip
@@ -280,7 +301,7 @@ export const SyncDropdown: FC<Props> = ({ gitSyncEnabled }) => {
               </Tooltip>
             </TooltipTrigger>
             <TooltipTrigger>
-              <Button>
+              <Button className="h-full px-2">
                 <Icon icon="cloud-download" className={`transition-colors ${canPull ? '' : 'opacity-50'} ${pullFetcher.state !== 'idle' ? 'animate-pulse' : ''}`} />
               </Button>
               <Tooltip
@@ -293,7 +314,7 @@ export const SyncDropdown: FC<Props> = ({ gitSyncEnabled }) => {
             </TooltipTrigger>
 
             <TooltipTrigger>
-              <Button>
+              <Button className="h-full pr-[--padding-md]">
                 <Icon icon="cloud-upload" className={`transition-colors ${canPush ? '' : 'opacity-50'} ${pushFetcher.state !== 'idle' ? 'animate-pulse' : ''}`} />
               </Button>
               <Tooltip

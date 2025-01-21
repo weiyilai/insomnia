@@ -6,16 +6,33 @@ import { JSONPath } from 'jsonpath-plus';
 import os from 'os';
 import { CookieJar } from 'tough-cookie';
 import * as uuid from 'uuid';
-import type { SelectedValue } from 'xpath';
 
-import { Request, RequestParameter } from '../../../models/request';
-import { Response } from '../../../models/response';
-import { TemplateTag } from '../../../plugins';
-import { PluginTemplateTag } from '../../../templating/extensions';
+import type { Request, RequestParameter } from '../../../models/request';
+import type { Response } from '../../../models/response';
+import type { TemplateTag } from '../../../plugins';
+import type { PluginTemplateTag } from '../../../templating/extensions';
 import { invariant } from '../../../utils/invariant';
 import { buildQueryStringFromParams, joinUrlAndQueryString, smartEncodeUrl } from '../../../utils/url/querystring';
+import { fakerFunctions } from './faker-functions';
 
 const localTemplatePlugins: { templateTag: PluginTemplateTag }[] = [
+  {
+    templateTag: {
+      name: 'faker',
+      displayName: 'Faker',
+      description: 'generate random outputs',
+      args: [
+        {
+          displayName: 'Function',
+          type: 'enum',
+          options: Object.keys(fakerFunctions).map(key => ({ displayName: key, value: key })),
+        },
+      ],
+      run(_context, keys: keyof typeof fakerFunctions) {
+        return fakerFunctions[keys]();
+      },
+    },
+  },
   {
     templateTag: {
       name: 'base64',
@@ -180,7 +197,8 @@ const localTemplatePlugins: { templateTag: PluginTemplateTag }[] = [
 
         if (JSONPath && ['userInfo', 'cpus'].includes(fnName)) {
           try {
-            value = JSONPath({ json: value, path: filter })[0];
+            const results = JSONPath({ json: value, path: filter });
+            value = Array.isArray(results) ? results[0] : results;
           } catch (err) { }
         }
 
@@ -286,6 +304,9 @@ const localTemplatePlugins: { templateTag: PluginTemplateTag }[] = [
         let results;
         try {
           results = JSONPath({ json: body, path: filter });
+          if (!Array.isArray(results)) {
+            results = [results];
+          }
         } catch (err) {
           throw new Error(`Invalid JSONPath query: ${filter}`);
         }
@@ -542,17 +563,17 @@ const localTemplatePlugins: { templateTag: PluginTemplateTag }[] = [
             },
             {
               displayName: 'No History',
-              description: 'resend when no responses present',
+              description: 'resend once if there are no available responses',
               value: 'no-history',
             },
             {
               displayName: 'When Expired',
-              description: 'resend when existing response has expired',
+              description: 'resend the request if current response is older than Max age seconds',
               value: 'when-expired',
             },
             {
               displayName: 'Always',
-              description: 'resend request when needed',
+              description: 'always resend the request',
               value: 'always',
             },
           ],
@@ -586,17 +607,26 @@ const localTemplatePlugins: { templateTag: PluginTemplateTag }[] = [
           throw new Error(`Could not find request ${id}`);
         }
 
-        const environmentId = context.context.getEnvironmentId?.();
+        let shouldResend = false;
+        const environmentId = context.context.getEnvironmentId?.() || null;
+        const globalEnvironmentId = context.context.getGlobalEnvironmentId?.() || null;
         let response: Response = await context.util.models.response.getLatestForRequestId(id, environmentId);
 
-        let shouldResend = false;
         switch (resendBehavior) {
           case 'no-history':
-            shouldResend = !response;
+            if (!response) {
+              shouldResend = true;
+            } else {
+              // if either global environment or collection environment changed, resend the request
+              shouldResend = response.environmentId !== environmentId || response.globalEnvironmentId !== globalEnvironmentId;
+            }
             break;
 
           case 'when-expired':
             if (!response) {
+              shouldResend = true;
+            } else if (response.environmentId !== environmentId || response.globalEnvironmentId !== globalEnvironmentId) {
+              // if either global environment or collection environment changed, resend the request
               shouldResend = true;
             } else {
               const ageSeconds = (Date.now() - response.created) / 1000;
@@ -698,6 +728,9 @@ const localTemplatePlugins: { templateTag: PluginTemplateTag }[] = [
 
             try {
               results = JSONPath({ json: bodyJSON, path: sanitizedFilter });
+              if (!Array.isArray(results)) {
+                results = [results];
+              }
             } catch (err) {
               throw new Error(`Invalid JSONPath query: ${sanitizedFilter}`);
             }
@@ -716,49 +749,49 @@ const localTemplatePlugins: { templateTag: PluginTemplateTag }[] = [
               return results[0];
             }
           } else {
-            const DOMParser = (await import('xmldom')).DOMParser;
+            const DOMParser = (await import('@xmldom/xmldom')).DOMParser;
             const dom = new DOMParser().parseFromString(body);
-            let selectedValues: SelectedValue[] = [];
             if (sanitizedFilter === undefined) {
               throw new Error('Must pass an XPath query.');
             }
             try {
-              selectedValues = (await import('xpath')).select(sanitizedFilter, dom);
+              const selectedValues = (await import('xpath')).select(sanitizedFilter, dom);
+
+              let results: { outer: string; inner: string | null }[] = [];
+
+              // Functions return plain strings
+              if (typeof selectedValues === 'string') {
+                results = [{ outer: selectedValues, inner: selectedValues }];
+              }
+
+              results = (selectedValues as Node[])
+                .filter(sv => sv.nodeType === Node.ATTRIBUTE_NODE
+                  || sv.nodeType === Node.ELEMENT_NODE
+                  || sv.nodeType === Node.TEXT_NODE)
+                .map(selectedValue => {
+                  const outer = selectedValue.toString().trim();
+                  if (selectedValue.nodeType === Node.ATTRIBUTE_NODE) {
+                    return { outer, inner: selectedValue.nodeValue };
+                  }
+                  if (selectedValue.nodeType === Node.ELEMENT_NODE) {
+                    return { outer, inner: selectedValue.childNodes.toString() };
+                  }
+                  if (selectedValue.nodeType === Node.TEXT_NODE) {
+                    return { outer, inner: selectedValue.toString().trim() };
+                  }
+                  return { outer, inner: null };
+                });
+
+              if (results.length === 0) {
+                throw new Error(`Returned no results: ${sanitizedFilter}`);
+              } else if (results.length > 1) {
+                throw new Error(`Returned more than one result: ${sanitizedFilter}`);
+              }
+
+              return results[0].inner;
             } catch (err) {
               throw new Error(`Invalid XPath query: ${sanitizedFilter}`);
             }
-            let results: { outer: string; inner: string | null }[] = [];
-
-            // Functions return plain strings
-            if (typeof selectedValues === 'string') {
-              results = [{ outer: selectedValues, inner: selectedValues }];
-            }
-
-            results = (selectedValues as Node[])
-              .filter(sv => sv.nodeType === Node.ATTRIBUTE_NODE
-                || sv.nodeType === Node.ELEMENT_NODE
-                || sv.nodeType === Node.TEXT_NODE)
-              .map(selectedValue => {
-                const outer = selectedValue.toString().trim();
-                if (selectedValue.nodeType === Node.ATTRIBUTE_NODE) {
-                  return { outer, inner: selectedValue.nodeValue };
-                }
-                if (selectedValue.nodeType === Node.ELEMENT_NODE) {
-                  return { outer, inner: selectedValue.childNodes.toString() };
-                }
-                if (selectedValue.nodeType === Node.TEXT_NODE) {
-                  return { outer, inner: selectedValue.toString().trim() };
-                }
-                return { outer, inner: null };
-              });
-
-            if (results.length === 0) {
-              throw new Error(`Returned no results: ${sanitizedFilter}`);
-            } else if (results.length > 1) {
-              throw new Error(`Returned more than one result: ${sanitizedFilter}`);
-            }
-
-            return results[0].inner;
           }
         }
       },

@@ -2,29 +2,32 @@ import './base-imports';
 
 import classnames from 'classnames';
 import clone from 'clone';
-import CodeMirror, { CodeMirrorLinkClickCallback, EditorConfiguration, ShowHintOptions } from 'codemirror';
-import { GraphQLInfoOptions } from 'codemirror-graphql/info';
-import { ModifiedGraphQLJumpOptions } from 'codemirror-graphql/jump';
+import CodeMirror, { type CodeMirrorLinkClickCallback, type EditorConfiguration, type ShowHintOptions } from 'codemirror';
+import type { GraphQLInfoOptions } from 'codemirror-graphql/info';
+import type { ModifiedGraphQLJumpOptions } from 'codemirror-graphql/jump';
 import deepEqual from 'deep-equal';
 import { JSONPath } from 'jsonpath-plus';
-import React, { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { Button, Menu, MenuItem, MenuTrigger, Popover } from 'react-aria-components';
+import React, { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { Button, Menu, MenuItem, MenuTrigger, Popover, Toolbar } from 'react-aria-components';
 import { useMount, useUnmount } from 'react-use';
 import vkBeautify from 'vkbeautify';
 
 import { DEBOUNCE_MILLIS, isMac } from '../../../common/constants';
 import * as misc from '../../../common/misc';
-import { KeyCombination } from '../../../common/settings';
+import type { KeyCombination } from '../../../common/settings';
 import { getTagDefinitions } from '../../../templating/index';
-import { NunjucksParsedTag } from '../../../templating/utils';
+import { extractNunjucksTagFromCoords, type NunjucksParsedTag, type nunjucksTagContextMenuOptions } from '../../../templating/utils';
+import { ednPrettify } from '../../../utils/prettify/edn';
 import { jsonPrettify } from '../../../utils/prettify/json';
 import { queryXPath } from '../../../utils/xpath/query';
 import { useGatedNunjucks } from '../../context/nunjucks/use-gated-nunjucks';
+import { useEditorRefresh } from '../../hooks/use-editor-refresh';
 import { useRootLoaderData } from '../../routes/root';
 import { Icon } from '../icon';
 import { createKeybindingsHandler, useDocBodyKeyboardShortcuts } from '../keydown-binder';
 import { FilterHelpModal } from '../modals/filter-help-modal';
 import { showModal } from '../modals/index';
+import { NunjucksModal } from '../modals/nunjucks-modal';
 import { isKeyCombinationInRegistry } from '../settings/shortcuts';
 import { normalizeIrregularWhitespace } from './normalizeIrregularWhitespace';
 const TAB_SIZE = 4;
@@ -90,9 +93,12 @@ export interface CodeEditorProps {
   noLint?: boolean;
   noMatchBrackets?: boolean;
   noStyleActiveLine?: boolean;
-  // used only for saving env editor state
+  // used only for saving env editor state, focusEvent doesn't work well
   onBlur?: (e: FocusEvent) => void;
+  onFocus?: (e: Event, editor?: CodeMirror.Editor) => void;
   onChange?: (value: string) => void;
+  onCursorActivity?: (doc: CodeMirror.Editor) => void;
+  onPaste?: (value: string) => string;
   onClickLink?: CodeMirrorLinkClickCallback;
   pinToBottom?: boolean;
   placeholder?: string;
@@ -106,7 +112,7 @@ export interface CodeEditorProps {
 const normalizeMimeType = (mode?: string) => {
   const mimeType = mode ? mode.split(';')[0] : 'text/plain';
   if (mimeType.includes('graphql-variables')) {
-    return 'graphql-variables';
+    return 'application/json';
   } else if (mimeType.includes('graphql')) {
     // Because graphQL plugin doesn't recognize application/graphql content-type
     return 'graphql';
@@ -133,8 +139,14 @@ export interface CodeEditorHandle {
   selectAll: () => void;
   focus: () => void;
   focusEnd: () => void;
+  getCursor: () => CodeMirror.Position | undefined;
+  setCursorLine: (lineNumber: number) => void;
+  tryToSetOption: (key: keyof EditorConfiguration, value: any) => void;
+  hasFocus: () => boolean;
+  indexFromPos: (pos?: CodeMirror.Position) => number;
+  getDoc: () => CodeMirror.Doc | undefined;
 }
-export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
+export const CodeEditor = memo(forwardRef<CodeEditorHandle, CodeEditorProps>(({
   autoPrettify,
   className,
   defaultValue,
@@ -156,8 +168,11 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
   noLint,
   noMatchBrackets,
   noStyleActiveLine,
+  onFocus,
   onBlur,
   onChange,
+  onCursorActivity,
+  onPaste,
   onClickLink,
   pinToBottom,
   placeholder,
@@ -176,7 +191,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
   const indentSize = settings.editorIndentSize;
   const indentWithTabs = shouldIndentWithTabs({ mode, indentWithTabs: settings.editorIndentWithTabs });
   const indentChars = indentWithTabs ? '\t' : new Array((indentSize || TAB_SIZE) + 1).join(' ');
-  const extraKeys = {
+  const extraKeys = useMemo(() => ({
     'Ctrl-Q': (cm: CodeMirror.Editor) => cm.foldCode(cm.getCursor()),
     [isMac() ? 'Cmd-/' : 'Ctrl-/']: 'toggleComment',
     // Autocomplete
@@ -190,45 +205,53 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
     // Indent with tabs or spaces
     // From https://github.com/codemirror/CodeMirror/issues/988#issuecomment-14921785
     Tab: (cm: CodeMirror.Editor) => cm.somethingSelected() ? cm.indentSelection('add') : cm.replaceSelection(indentChars, 'end'),
-  };
+  }), [indentChars]);
   const { handleRender, handleGetRenderContext } = useGatedNunjucks({ disabled: !enableNunjucks });
-  const prettifyXML = (code: string, filter?: string) => {
-    if (updateFilter && filter) {
-      try {
-        const results = queryXPath(code, filter);
-        code = `<result>${results.map(r => r.outer).join('\n')}</result>`;
-      } catch (err) {
-        // Failed to parse filter (that's ok)
-        code = `<error>${err.message}</error>`;
-      }
-    }
-    try {
-      return vkBeautify.xml(code, indentChars);
-    } catch (error) {
-      // Failed to parse so just return original
-      return code;
-    }
-  };
-  const prettifyJSON = (code: string, filter?: string) => {
-    try {
-      let jsonString = code;
+
+  const maybePrettifyAndSetValue = useCallback((code?: string, forcePrettify?: boolean, filter?: string) => {
+    const prettifyXML = (code: string, filter?: string) => {
       if (updateFilter && filter) {
         try {
-          const codeObj = JSON.parse(code);
-          const results = JSONPath({ json: codeObj, path: filter.trim() });
-          jsonString = JSON.stringify(results);
+          const results = queryXPath(code, filter);
+          code = `<result>${results.map(r => r.outer).join('\n')}</result>`;
         } catch (err) {
-          console.log('[jsonpath] Error: ', err);
-          jsonString = '[]';
+          // Failed to parse filter (that's ok)
+          code = `<error>${err.message}</error>`;
         }
       }
-      return jsonPrettify(jsonString, indentChars, autoPrettify);
-    } catch (error) {
-      // That's Ok, just leave it
-      return code;
-    }
-  };
-  const maybePrettifyAndSetValue = (code?: string, forcePrettify?: boolean, filter?: string) => {
+      try {
+        return vkBeautify.xml(code, indentChars);
+      } catch (error) {
+        // Failed to parse so just return original
+        return code;
+      }
+    };
+    const prettifyJSON = (code: string, filter?: string) => {
+      try {
+        let jsonString = code;
+        if (updateFilter && filter) {
+          try {
+            const codeObj = JSON.parse(code);
+            const results = JSONPath({ json: codeObj, path: filter.trim() });
+            jsonString = JSON.stringify(results);
+          } catch (err) {
+            console.log('[jsonpath] Error: ', err);
+            jsonString = '[]';
+          }
+        }
+        return jsonPrettify(jsonString, indentChars, autoPrettify);
+      } catch (error) {
+        // That's Ok, just leave it
+        return code;
+      }
+    };
+    const prettifyEDN = (code: string) => {
+      try {
+        return ednPrettify(code);
+      } catch (error) {
+        return code;
+      }
+    };
     if (typeof code !== 'string') {
       console.warn('Code editor was passed non-string value', code);
       return;
@@ -240,6 +263,8 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
         code = prettifyXML(code, filter);
       } else if (mode?.includes('json')) {
         code = prettifyJSON(code, filter);
+      } else if (mode?.includes('edn')) {
+        code = prettifyEDN(code);
       }
     }
     // this prevents codeMirror from needlessly setting the same thing repeatedly (which has the effect of moving the user's cursor and resetting the viewport scroll: a bad user experience)
@@ -248,7 +273,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
       return;
     }
     codeMirror.current?.setValue(code || '');
-  };
+  }, [autoPrettify, mode, indentChars, updateFilter]);
 
   useDocBodyKeyboardShortcuts({
     beautifyRequestBody: () => {
@@ -258,7 +283,28 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
     },
   });
 
-  useMount(() => {
+  // NOTE: maybe we don't need this anymore? Maybe not.
+  const persistState = useCallback(() => {
+    if (uniquenessKey && codeMirror.current) {
+      editorStates[uniquenessKey] = {
+        scroll: codeMirror.current.getScrollInfo(),
+        selections: codeMirror.current.listSelections(),
+        cursor: codeMirror.current.getCursor(),
+        history: codeMirror.current.getHistory(),
+        marks: codeMirror.current.getAllMarks()
+          .filter(mark => mark.__isFold)
+          .map((mark): Partial<CodeMirror.MarkerRange> => {
+            const markerRange = mark.find();
+            return markerRange && 'from' in markerRange ? markerRange : {
+              from: undefined,
+              to: undefined,
+            };
+          }),
+      };
+    }
+  }, [uniquenessKey, codeMirror]);
+
+  const initEditor = useCallback(() => {
     if (!textAreaRef.current) {
       return;
     }
@@ -328,6 +374,20 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
         const scrollPosition = scrollInfo.height - scrollInfo.clientHeight;
         doc.scrollTo(0, scrollPosition);
       }
+
+      if (onPaste) {
+        if (change.origin === 'paste' && change.update) {
+          const translatedText = onPaste(
+            change.text.join('\n')
+          ).split('\n');
+
+          change.update(
+            change.from,
+            change.to,
+            translatedText,
+          );
+        }
+      }
     });
 
     codeMirror.current.on('change', (doc: CodeMirror.Editor) => {
@@ -346,6 +406,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
         meta: event.metaKey,
         keyCode: event.keyCode,
       };
+
       const isUserDefinedKeyboardShortcut = isKeyCombinationInRegistry(pressedKeyComb, settings.hotKeyRegistry);
       const isAutoCompleteBinding = isKeyCombinationInRegistry(pressedKeyComb, {
         'showAutocomplete': settings.hotKeyRegistry.showAutocomplete,
@@ -378,26 +439,6 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
         }
       }
     });
-    // NOTE: maybe we don't need this anymore?
-    const persistState = () => {
-      if (uniquenessKey && codeMirror.current) {
-        editorStates[uniquenessKey] = {
-          scroll: codeMirror.current.getScrollInfo(),
-          selections: codeMirror.current.listSelections(),
-          cursor: codeMirror.current.getCursor(),
-          history: codeMirror.current.getHistory(),
-          marks: codeMirror.current.getAllMarks()
-            .filter(mark => mark.__isFold)
-            .map((mark): Partial<CodeMirror.MarkerRange> => {
-              const markerRange = mark.find();
-              return markerRange && 'from' in markerRange ? markerRange : {
-                from: undefined,
-                to: undefined,
-              };
-            }),
-        };
-      }
-    };
 
     codeMirror.current.on('scroll', persistState);
     codeMirror.current.on('fold', persistState);
@@ -415,6 +456,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
         handleRender,
         handleGetRenderContext,
         settings.showVariableSourceAndValue,
+        id,
       );
     }
     // Make URLs clickable
@@ -435,12 +477,28 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
         codeMirror.current.foldCode(from, to);
       }
     }
-  });
-  useUnmount(() => {
+  }, [hideGutters, hideLineNumbers, placeholder, settings.editorLineWrapping, settings.editorKeyMap, settings.hotKeyRegistry, settings.autocompleteDelay, settings.nunjucksPowerUserMode, settings.showVariableSourceAndValue, noLint, readOnly, noMatchBrackets, indentSize, hintOptions, infoOptions, dynamicHeight, jumpOptions, noStyleActiveLine, indentWithTabs, extraKeys, handleRender, mode, getAutocompleteConstants, getAutocompleteSnippets, persistState, maybePrettifyAndSetValue, defaultValue, filter, onClickLink, uniquenessKey, handleGetRenderContext, pinToBottom, onPaste, id]);
+
+  const cleanUpEditor = useCallback(() => {
     codeMirror.current?.toTextArea();
     codeMirror.current?.closeHintDropdown();
     codeMirror.current = null;
+  }, []);
+
+  useMount(() => {
+    initEditor();
   });
+  useUnmount(() => {
+    persistState();
+    cleanUpEditor();
+  });
+
+  const reinitialize = useCallback(() => {
+    cleanUpEditor();
+    initEditor();
+  }, [cleanUpEditor, initEditor]);
+
+  useEditorRefresh(reinitialize);
 
   useEffect(() => {
     const fn = misc.debounce((doc: CodeMirror.Editor) => {
@@ -457,12 +515,13 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
             tryToSetOption('lint', newValue);
           }
         } catch (err) {
-          console.log('Failed to set CodeMirror option', err.message);
+          console.log('[codemirror] Failed to set CodeMirror option', err.message);
         }
         onChange(doc.getValue() || '');
         setOriginalCode(doc.getValue() || '');
       }
     }, DEBOUNCE_MILLIS);
+
     codeMirror.current?.on('changes', fn);
     return () => codeMirror.current?.off('changes', fn);
   }, [lintOptions, noLint, onChange]);
@@ -473,18 +532,57 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
     return () => codeMirror.current?.off('blur', handleOnBlur);
   }, [onBlur]);
 
+  useEffect(() => {
+    const handleOnFocus = (_: CodeMirror.Editor, e: FocusEvent) => onFocus?.(e, _);
+    codeMirror.current?.on('focus', handleOnFocus);
+    return () => codeMirror.current?.off('focus', handleOnFocus);
+  }, [onFocus]);
+
   const tryToSetOption = (key: keyof EditorConfiguration, value: any) => {
     try {
       codeMirror.current?.setOption(key, value);
     } catch (err) {
-      console.log('Failed to set CodeMirror option', err.message, { key, value });
+      console.log('[codemirror] Failed to set CodeMirror option', err.message, { key, value });
     }
   };
-  useEffect(() => window.main.on('context-menu-command', (_, { key, tag }) =>
-    id === key && codeMirror.current?.replaceSelection(tag)), [id]);
+  useEffect(() => {
+    const unsubscribe = window.main.on('context-menu-command', (_, { key, tag, nunjucksTag }) => {
+      if (id === key) {
+        if (nunjucksTag) {
+          const { type, template, range } = nunjucksTag as nunjucksTagContextMenuOptions;
+          switch (type) {
+            case 'edit':
+              showModal(NunjucksModal, {
+                template: template,
+                editorId: id,
+                onDone: (template: string | null) => {
+                  const { from, to } = range;
+                  codeMirror.current?.replaceRange(template!, from, to);
+                },
+              });
+              return;
+
+            case 'delete':
+              const { from, to } = range;
+              codeMirror.current?.replaceRange('', from, to);
+              return;
+
+            default:
+              return;
+          };
+        } else {
+          codeMirror.current?.replaceSelection(tag);
+        }
+      }
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [id]);
   useEffect(() => tryToSetOption('hintOptions', hintOptions), [hintOptions]);
   useEffect(() => tryToSetOption('info', infoOptions), [infoOptions]);
   useEffect(() => tryToSetOption('jump', jumpOptions), [jumpOptions]);
+  // This line will trigger codeMirror lint
   useEffect(() => tryToSetOption('lint', lintOptions), [lintOptions]);
   useEffect(() => tryToSetOption('mode', !handleRender ? normalizeMimeType(mode) : { name: 'nunjucks', baseMode: normalizeMimeType(mode) }), [handleRender, mode]);
 
@@ -504,7 +602,35 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
       }
       codeMirror.current?.getDoc()?.setCursor(codeMirror.current.getDoc().lineCount(), 0);
     },
+    getCursor: () => {
+      return codeMirror.current?.getCursor();
+    },
+    setCursorLine: (lineNumber: number) => {
+      codeMirror.current?.setCursor(lineNumber);
+    },
+    tryToSetOption,
+    hasFocus: () => codeMirror.current?.hasFocus() as boolean,
+    indexFromPos: (pos?: CodeMirror.Position) => pos ? codeMirror.current?.indexFromPos(pos) || 0 : 0,
+    getDoc: () => codeMirror.current?.getDoc(),
   }), []);
+
+  useEffect(() => {
+    const handleCursorActivity = (doc: CodeMirror.Editor) => {
+      onCursorActivity?.(doc);
+    };
+
+    const handleFocus = (_: CodeMirror.Editor, event: Event) => {
+      onFocus?.(event);
+    };
+    codeMirror.current?.on('cursorActivity', handleCursorActivity);
+
+    codeMirror.current?.on('focus', handleFocus);
+
+    return () => {
+      codeMirror.current?.off('cursorActivity', handleCursorActivity);
+      codeMirror.current?.off('focus', handleFocus);
+    };
+  }, [onCursorActivity, onFocus]);
 
   const showFilter = readOnly && (mode?.includes('json') || mode?.includes('xml'));
   const showPrettify = showPrettifyButton && mode?.includes('json') || mode?.includes('xml');
@@ -520,11 +646,22 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
       data-editor-type="text"
       data-testid="CodeEditor"
       onContextMenu={event => {
-        if (readOnly) {
+        if (readOnly || !enableNunjucks) {
           return;
         }
         event.preventDefault();
-        window.main.showContextMenu({ key: id });
+        const target = event.target as HTMLElement;
+        // right click on nunjucks tag
+        if (target?.classList?.contains('nunjucks-tag')) {
+          const { clientX, clientY } = event;
+          const nunjucksTag = extractNunjucksTagFromCoords({ left: clientX, top: clientY }, codeMirror);
+          if (nunjucksTag) {
+            // show context menu for nunjucks tag
+            window.main.showContextMenu({ key: id, nunjucksTag });
+          }
+        } else {
+          window.main.showContextMenu({ key: id });
+        }
       }}
     >
       <div
@@ -542,12 +679,13 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
       </div>
       {
         showFilter || showPrettify ? (
-          <div key={uniquenessKey} className="editor__toolbar">
+          <div key={uniquenessKey} className="flex w-full items-center border-solid border-t border-[--hl-md] h-[--line-height-sm] text-[--font-size-sm]">
             {showFilter ?
               (<input
                 ref={inputRef}
                 key="filter"
                 type="text"
+                className='flex-1 pl-3'
                 title="Filter response body"
                 defaultValue={filter || ''}
                 placeholder={mode?.includes('json') ? '$.store.books[*].author' : '/store/books/author'}
@@ -569,104 +707,74 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(({
                   }
                 }}
               />) : null}
-            {/* {showFilter && filterHistory?.length ?
-              (
-                <Dropdown
-                  aria-label='Filter History'
-                  key="history"
-                  className="tall"
-                  triggerButton={
-                    <DropdownButton className="btn btn--compact">
-                      <i className="fa fa-clock-o" />
-                    </DropdownButton>
-                  }
-                >
-                  {filterHistory.reverse().map(filter => (
-                    <DropdownItem
-                      key={JSON.stringify(filter)}
-                      aria-label={filter}
-                    >
-                      <ItemContent
-                        aria-label={filter}
-                        label={filter}
-                        onClick={() => {
-                          if (inputRef.current) {
-                            inputRef.current.value = filter;
-                          }
-                          if (updateFilter) {
-                            updateFilter(filter);
-                          }
-                          maybePrettifyAndSetValue(originalCode, false, filter);
-                        }}
-                      />
-                    </DropdownItem>
-                  ))}
-                </Dropdown>
-              ) : null} */}
-
-            {showFilter && filterHistory?.length && (
-              <MenuTrigger>
-                <Button
-                  aria-label="Filter History"
-                  className="flex items-center justify-center h-full aspect-square aria-pressed:bg-[--hl-sm] rounded-sm text-[--color-font] hover:bg-[--hl-xs] focus:ring-inset ring-1 ring-transparent focus:ring-[--hl-md] transition-all text-sm"
-                >
-                  <Icon icon="clock" />
-                </Button>
-                <Popover className="min-w-max">
-                  <Menu
-                    aria-label="Filter history menu"
-                    selectionMode="single"
-                    onAction={key => {
-                      const index = Number(key);
-                      const filter = filterHistory[index];
-                      if (inputRef.current) {
-                        inputRef.current.value = filter;
-                      }
-                      if (updateFilter) {
-                        updateFilter(filter);
-                      }
-                      maybePrettifyAndSetValue(originalCode, false, filter);
-                    }}
-                    items={filterHistory.map((filter, index) => ({
-                      id: filter,
-                      name: filter,
-                      key: index,
-                    }))}
-                    className="border select-none text-sm min-w-max border-solid border-[--hl-sm] shadow-lg bg-[--color-bg] py-2 rounded-md overflow-y-auto max-h-[85vh] focus:outline-none"
+            <Toolbar className="flex items-center h-full">
+              {showFilter && filterHistory && filterHistory.length > 0 && (
+                <MenuTrigger>
+                  <Button
+                    aria-label="Filter History"
+                    className="flex items-center justify-center h-full aspect-square aria-pressed:bg-[--hl-sm] rounded-sm text-[--color-font] hover:bg-[--hl-xs] focus:ring-inset ring-1 ring-transparent focus:ring-[--hl-md] transition-all text-sm"
                   >
-                    {item => (
-                      <MenuItem
-                        className="flex gap-2 px-[--padding-md] aria-selected:font-bold items-center text-[--color-font] h-[--line-height-xs] w-full text-md whitespace-nowrap bg-transparent hover:bg-[--hl-sm] disabled:cursor-not-allowed focus:bg-[--hl-xs] focus:outline-none transition-colors"
-                        aria-label={item.name}
-                      >
-                        <span>{item.name}</span>
-                      </MenuItem>
-                    )}
-                  </Menu>
-                </Popover>
-              </MenuTrigger>
-            )}
-            {showFilter ?
-              (<button key="help" className="btn btn--compact" onClick={() => showModal(FilterHelpModal, { isJSON: Boolean(mode?.includes('json')) })}>
-                <i className="fa fa-question-circle" />
-              </button>) : null}
-            {showPrettify ?
-              (<button
-                key="prettify"
-                className="btn btn--compact"
-                title="Auto-format request body whitespace"
-                onClick={() => {
-                  if (mode?.includes('json') || mode?.includes('xml')) {
-                    maybePrettifyAndSetValue(codeMirror.current?.getValue(), true);
-                  }
-                }}
-              >
-                Beautify {mode?.includes('json') ? 'JSON' : mode?.includes('xml') ? 'XML' : ''}
-              </button>) : null}
+                    <Icon icon="clock" />
+                  </Button>
+                  <Popover className="min-w-max overflow-y-hidden flex flex-col">
+                    <Menu
+                      aria-label="Filter history menu"
+                      selectionMode="single"
+                      onAction={key => {
+                        const index = Number(key);
+                        const filter = filterHistory[index];
+                        if (inputRef.current) {
+                          inputRef.current.value = filter;
+                        }
+                        if (updateFilter) {
+                          updateFilter(filter);
+                        }
+                        maybePrettifyAndSetValue(originalCode, false, filter);
+                      }}
+                      items={filterHistory.map((filter, index) => ({
+                        id: filter,
+                        name: filter,
+                        key: index,
+                      }))}
+                      className="border select-none text-sm min-w-max border-solid border-[--hl-sm] shadow-lg bg-[--color-bg] py-2 rounded-md overflow-y-auto focus:outline-none"
+                    >
+                      {item => (
+                        <MenuItem
+                          className="flex gap-2 px-[--padding-md] aria-selected:font-bold items-center text-[--color-font] h-[--line-height-xs] w-full text-md whitespace-nowrap bg-transparent hover:bg-[--hl-sm] disabled:cursor-not-allowed focus:bg-[--hl-xs] focus:outline-none transition-colors"
+                          aria-label={item.name}
+                        >
+                          <span>{item.name}</span>
+                        </MenuItem>
+                      )}
+                    </Menu>
+                  </Popover>
+                </MenuTrigger>
+              )}
+
+              {showFilter ? (
+                <Button key="help" className="px-4 py-1 h-full flex items-center justify-center gap-2 aria-pressed:bg-[--hl-sm] text-[--color-font] text-xs hover:bg-[--hl-xs] focus:ring-inset ring-1 ring-transparent focus:ring-[--hl-md] transition-all" onPress={() => showModal(FilterHelpModal, { isJSON: Boolean(mode?.includes('json')) })}>
+                  <i className="fa fa-question-circle" />
+                </Button>
+              ) : null}
+              {showPrettify ? (
+                <Button
+                  key="prettify"
+                  className="px-4 py-1 h-full flex items-center justify-center gap-2 aria-pressed:bg-[--hl-sm] text-[--color-font] text-xs hover:bg-[--hl-xs] focus:ring-inset ring-1 ring-transparent focus:ring-[--hl-md] transition-all"
+                  aria-label="Auto-format request body whitespace"
+                  onPress={() => {
+                    if (mode?.includes('json') || mode?.includes('xml')) {
+                      maybePrettifyAndSetValue(codeMirror.current?.getValue(), true);
+                    }
+                  }}
+                >
+                  Beautify {mode?.includes('json') ? 'JSON' : mode?.includes('xml') ? 'XML' : ''}
+                </Button>
+              ) : null}
+            </Toolbar>
           </div>
         ) : null
       }
     </div >
   );
-});
+}));
 CodeEditor.displayName = 'CodeEditor';

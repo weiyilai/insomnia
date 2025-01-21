@@ -1,21 +1,22 @@
 import { Readable } from 'node:stream';
 
-import { Curl, CurlFeature, CurlInfoDebug, HeaderInfo } from '@getinsomnia/node-libcurl';
-import electron, { BrowserWindow, ipcMain } from 'electron';
+import { Curl, CurlFeature, CurlInfoDebug, type HeaderInfo } from '@getinsomnia/node-libcurl';
+import electron, { BrowserWindow } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import { v4 as uuidV4 } from 'uuid';
 
 import { describeByteSize, generateId, getSetCookieHeaders } from '../../common/misc';
 import * as models from '../../models';
-import { CookieJar } from '../../models/cookie-jar';
-import { Environment } from '../../models/environment';
-import { RequestAuthentication, RequestHeader } from '../../models/request';
-import { Response } from '../../models/response';
+import type { CookieJar } from '../../models/cookie-jar';
+import type { Environment } from '../../models/environment';
+import type { RequestAuthentication, RequestHeader } from '../../models/request';
+import type { Response } from '../../models/response';
+import { readCurlResponse } from '../../models/response';
+import { filterClientCertificates } from '../../network/certificate';
 import { addSetCookiesToToughCookieJar } from '../../network/set-cookie-util';
-import { urlMatchesCertHost } from '../../network/url-matches-cert-host';
 import { invariant } from '../../utils/invariant';
-import { setDefaultProtocol } from '../../utils/url/protocol';
+import { ipcMainHandle, ipcMainOn } from '../ipc/electron';
 import { createConfiguredCurlInstance } from './libcurl-promise';
 import { parseHeaderStrings } from './parse-header-strings';
 
@@ -86,6 +87,7 @@ interface OpenCurlRequestOptions {
   workspaceId: string;
   url: string;
   headers: RequestHeader[];
+  authHeader?: { name: string; value: string };
   authentication: RequestAuthentication;
   cookieJar: CookieJar;
   initialPayload?: string;
@@ -109,7 +111,6 @@ const openCurlConnection = async (
   }
 
   const responsesDir = path.join(process.env['INSOMNIA_DATA_PATH'] || electron.app.getPath('userData'), 'responses');
-  fs.mkdirSync(responsesDir, { recursive: true });
 
   const responseBodyPath = path.join(responsesDir, uuidV4() + '.response');
   eventLogFileStreams.set(options.requestId, fs.createWriteStream(responseBodyPath));
@@ -134,7 +135,7 @@ const openCurlConnection = async (
     const settings = await models.settings.get();
     const start = performance.now();
     const clientCertificates = await models.clientCertificate.findByParentId(options.workspaceId);
-    const filteredClientCertificates = clientCertificates.filter(c => !c.disabled && urlMatchesCertHost(setDefaultProtocol(c.host, 'https:'), options.url));
+    const filteredClientCertificates = filterClientCertificates(clientCertificates, options.url, 'https:');
     const { curl, debugTimeline } = createConfiguredCurlInstance({
       req: { ...request, cookieJar: options.cookieJar, cookies: [], suppressUserAgent: options.suppressUserAgent },
       finalUrl: options.url,
@@ -142,11 +143,15 @@ const openCurlConnection = async (
       caCert: caCertificate,
       certificates: filteredClientCertificates,
     });
+    // set method
+    curl.setOpt(Curl.option.CUSTOMREQUEST, request.method);
+    // TODO: support all post data content types
+    curl.setOpt(Curl.option.POSTFIELDS, request.body?.text || '');
     debugTimeline.forEach(entry => timelineFileStreams.get(options.requestId)?.write(JSON.stringify(entry) + '\n'));
     CurlConnections.set(options.requestId, curl);
     CurlConnections.get(options.requestId)?.enable(CurlFeature.StreamResponse);
-    // TODO: add authHeader and request body?
-    const headerStrings = parseHeaderStrings({ req: request, finalUrl: options.url });
+    const headerStrings = parseHeaderStrings({ req: request, finalUrl: options.url, authHeader: options.authHeader });
+
     CurlConnections.get(options.requestId)?.setOpt(Curl.option.HTTPHEADER, headerStrings);
     CurlConnections.get(options.requestId)?.on('error', async (error, errorCode) => {
       const errorEvent: CurlErrorEvent = {
@@ -158,11 +163,11 @@ const openCurlConnection = async (
         timestamp: Date.now(),
       };
       console.error('curl - error: ', error, errorCode);
+      CurlConnections.get(options.requestId)?.close();
       deleteRequestMaps(request._id, error.message, errorEvent);
       for (const window of BrowserWindow.getAllWindows()) {
         window.webContents.send(readyStateChannel, false);
       }
-      curl.close();
       if (errorCode) {
         const res = await models.response.getById(responseId);
         if (!res) {
@@ -253,8 +258,20 @@ const openCurlConnection = async (
         };
         eventLogFileStreams.get(options.requestId)?.write(JSON.stringify(messageEvent) + '\n');
       }
-      // NOTE: this can only happen if the stream is closed cleanly by the remote server
-      eventLogFileStreams.get(options.requestId)?.end();
+
+      // NOTE: when stream is closed by remote server
+      const closeEvent: CurlCloseEvent = {
+        _id: uuidV4(),
+        requestId: options.requestId,
+        type: 'close',
+        timestamp: Date.now(),
+        statusCode,
+        reason: '',
+        code: 0,
+        wasClean: true,
+      };
+      CurlConnections.get(options.requestId)?.close();
+      deleteRequestMaps(options.requestId, 'Closing connection', closeEvent);
       for (const window of BrowserWindow.getAllWindows()) {
         window.webContents.send(readyStateChannel, false);
       }
@@ -326,7 +343,7 @@ const closeCurlConnection = (
   }
 };
 
-const closeAllCurlConnections = (): void => CurlConnections.forEach(curl => curl.close());
+const closeAllCurlConnections = (): void => CurlConnections.forEach(curl => curl.isOpen && curl.close());
 
 const findMany = async (
   options: { responseId: string }
@@ -354,12 +371,14 @@ export interface CurlBridgeAPI {
     findMany: typeof findMany;
   };
 }
+
 export const registerCurlHandlers = () => {
-  ipcMain.handle('curl.open', openCurlConnection);
-  ipcMain.on('curl.close', closeCurlConnection);
-  ipcMain.on('curl.closeAll', closeAllCurlConnections);
-  ipcMain.handle('curl.readyState', (_, options: Parameters<typeof getCurlReadyState>[0]) => getCurlReadyState(options));
-  ipcMain.handle('curl.event.findMany', (_, options: Parameters<typeof findMany>[0]) => findMany(options));
+  ipcMainHandle('curl.open', openCurlConnection);
+  ipcMainOn('curl.close', closeCurlConnection);
+  ipcMainOn('curl.closeAll', closeAllCurlConnections);
+  ipcMainHandle('curl.readyState', (_, options: Parameters<typeof getCurlReadyState>[0]) => getCurlReadyState(options));
+  ipcMainHandle('curl.event.findMany', (_, options: Parameters<typeof findMany>[0]) => findMany(options));
+  ipcMainHandle('readCurlResponse', (_, options: Parameters<typeof readCurlResponse>[0]) => readCurlResponse(options));
 };
 
 electron.app.on('window-all-closed', closeAllCurlConnections);

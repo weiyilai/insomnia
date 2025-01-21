@@ -1,9 +1,12 @@
-import React, { createContext, FC, PropsWithChildren, useContext, useEffect, useState } from 'react';
-import { useFetcher, useParams, useRevalidator, useRouteLoaderData } from 'react-router-dom';
+import React, { createContext, type FC, type PropsWithChildren, useContext, useEffect, useState } from 'react';
+import { useFetcher, useParams, useRouteLoaderData } from 'react-router-dom';
 
-import { getCurrentSessionId } from '../../../account/session';
-import { ProjectLoaderData } from '../../routes/project';
-import { WorkspaceLoaderData } from '../../routes/workspace';
+import { CDN_INVALIDATION_TTL } from '../../../common/constants';
+import { insomniaFetch } from '../../../ui/insomniaFetch';
+import { avatarImageCache } from '../../hooks/image-cache';
+import type { ProjectIdLoaderData } from '../../routes/project';
+import { useRootLoaderData } from '../../routes/root';
+import type { WorkspaceLoaderData } from '../../routes/workspace';
 
 const InsomniaEventStreamContext = createContext<{
   presence: UserPresence[];
@@ -61,7 +64,7 @@ export interface UserPresence {
 }
 
 interface UserPresenceEvent extends UserPresence {
-  type: 'PresentUserLeave' | 'PresentStateChanged' | 'OrganizationChanged';
+  type: 'PresentUserLeave' | 'PresentStateChanged' | 'OrganizationChanged' | 'StorageRuleChanged';
 }
 
 export const InsomniaEventStreamProvider: FC<PropsWithChildren> = ({ children }) => {
@@ -75,23 +78,24 @@ export const InsomniaEventStreamProvider: FC<PropsWithChildren> = ({ children })
       workspaceId: string;
   };
 
-  const projectData = useRouteLoaderData('/project/:projectId') as ProjectLoaderData | null;
+  const { userSession } = useRootLoaderData();
+  const projectData = useRouteLoaderData('/project/:projectId') as ProjectIdLoaderData | null;
   const workspaceData = useRouteLoaderData(':workspaceId') as WorkspaceLoaderData | null;
-  const remoteId = projectData?.activeProject.remoteId || workspaceData?.activeProject.remoteId;
+  const remoteId = projectData?.activeProject?.remoteId || workspaceData?.activeProject.remoteId;
 
   const [presence, setPresence] = useState<UserPresence[]>([]);
   const syncOrganizationsFetcher = useFetcher();
+  const syncStorageRuleFetcher = useFetcher();
   const syncProjectsFetcher = useFetcher();
   const syncDataFetcher = useFetcher();
-  const { revalidate } = useRevalidator();
 
   // Update presence when the user switches org, projects, workspaces
   useEffect(() => {
     async function updatePresence() {
-      const sessionId = getCurrentSessionId();
+      const sessionId = userSession.id;
       if (sessionId && remoteId) {
         try {
-          const response = await window.main.insomniaFetch<{
+          const response = await insomniaFetch<{
             data?: UserPresence[];
             }>({
               path: `/v1/organizations/${sanitizeTeamId(organizationId)}/collaborators`,
@@ -108,17 +112,17 @@ export const InsomniaEventStreamProvider: FC<PropsWithChildren> = ({ children })
             setPresence(rows);
           }
         } catch (e) {
-          console.log('Error parsing response', e);
+          console.log('[sse] Error parsing response', e);
         }
       }
     }
 
     updatePresence();
-  }, [organizationId, remoteId, workspaceId]);
+  }, [organizationId, remoteId, userSession.id, workspaceId]);
 
   useEffect(() => {
-    const sessionId = getCurrentSessionId();
-    if (sessionId && remoteId) {
+    const sessionId = userSession.id;
+    if (sessionId) {
       try {
         const source = new EventSource(`insomnia-event-source://v1/teams/${sanitizeTeamId(organizationId)}/streams?sessionId=${sessionId}`);
 
@@ -139,10 +143,26 @@ export const InsomniaEventStreamProvider: FC<PropsWithChildren> = ({ children })
                 return true;
               }));
             } else if (event.type === 'PresentStateChanged') {
-              setPresence(prev => [...prev.filter(p => p.acct !== event.acct), event]);
+              setPresence(prev => {
+                if (!prev.find(p => p.avatar === event.avatar)) {
+                  // if this avatar is new, invalidate the cache
+                  window.setTimeout(() => avatarImageCache.invalidate(event.avatar), CDN_INVALIDATION_TTL);
+                }
+                return [...prev.filter(p => p.acct !== event.acct), event];
+              });
             } else if (event.type === 'OrganizationChanged') {
+              if (event.avatar) {
+                window.setTimeout(() => avatarImageCache.invalidate(event.avatar), CDN_INVALIDATION_TTL);
+              }
               syncOrganizationsFetcher.submit({}, {
                 action: '/organization/sync',
+                method: 'POST',
+              });
+            } else if (event.type === 'StorageRuleChanged' && event.team && event.team.includes('org_')) {
+              const orgId = event.team;
+
+              syncStorageRuleFetcher.submit({}, {
+                action: `/organization/${orgId}/sync-storage-rule`,
                 method: 'POST',
               });
             } else if (event.type === 'TeamProjectChanged' && event.team === organizationId) {
@@ -150,31 +170,31 @@ export const InsomniaEventStreamProvider: FC<PropsWithChildren> = ({ children })
                 action: `/organization/${organizationId}/sync-projects`,
                 method: 'POST',
               });
-            } else if (event.type === 'FileDeleted' && event.team === organizationId && event.project === remoteId) {
+            } else if (event.type === 'FileDeleted' && event.team === organizationId && remoteId && event.project === remoteId) {
               syncProjectsFetcher.submit({}, {
                 action: `/organization/${organizationId}/sync-projects`,
                 method: 'POST',
               });
-            } else if (['BranchDeleted', 'FileChanged'].includes(event.type) && event.team === organizationId && event.project === remoteId) {
+            } else if (['BranchDeleted', 'FileChanged'].includes(event.type) && event.team === organizationId && remoteId && event.project === remoteId) {
               syncDataFetcher.submit({}, {
                 method: 'POST',
                 action: `/organization/${organizationId}/project/${projectId}/workspace/${workspaceId}/insomnia-sync/sync-data`,
               });
             }
           } catch (e) {
-            console.log('Error parsing response from SSE', e);
+            console.log('[sse] Error parsing response from SSE', e);
           }
         });
         return () => {
           source.close();
         };
       } catch (e) {
-        console.log('ERROR', e);
+        console.log('[sse] ERROR', e);
         return;
       }
     }
     return;
-  }, [organizationId, projectId, remoteId, revalidate, syncDataFetcher, syncOrganizationsFetcher, syncProjectsFetcher, workspaceId]);
+  }, [organizationId, projectId, remoteId, syncDataFetcher, syncOrganizationsFetcher, syncProjectsFetcher, syncStorageRuleFetcher, userSession.id, workspaceId]);
 
   return (
     <InsomniaEventStreamContext.Provider

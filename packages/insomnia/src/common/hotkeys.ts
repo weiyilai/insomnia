@@ -1,6 +1,6 @@
 import { displayModifierKey, isMac } from './constants';
 import { keyboardKeys } from './keyboard-keys';
-import { HotKeyRegistry, KeyboardShortcut, KeyCombination, PlatformKeyCombinations } from './settings';
+import type { HotKeyRegistry, KeyboardShortcut, KeyCombination, PlatformKeyCombinations } from './settings';
 import { strings } from './strings';
 
 /**
@@ -13,8 +13,6 @@ export const keyboardShortcutDescriptions: Record<KeyboardShortcut, string> = {
   'preferences_showKeyboardShortcuts': 'Show Keyboard Shortcuts',
   'preferences_showGeneral': 'Show App Preferences',
   'request_quickSwitch': 'Quick search',
-  'request_showRecent': 'Show Recent Requests',
-  'request_showRecentPrevious': 'Show Recent Requests (Previous)',
   'plugin_reload': 'Reload Plugins',
   'showAutocomplete': 'Show Autocomplete',
   'request_send': 'Send Request',
@@ -62,14 +60,6 @@ const defaultRegistry: HotKeyRegistry = {
   request_quickSwitch: {
     macKeys: [{ meta: true, keyCode: keyboardKeys.p.keyCode }],
     winLinuxKeys: [{ ctrl: true, keyCode: keyboardKeys.p.keyCode }],
-  },
-  request_showRecent: {
-    macKeys: [{ ctrl: true, keyCode: keyboardKeys.tab.keyCode }],
-    winLinuxKeys: [{ ctrl: true, keyCode: keyboardKeys.tab.keyCode }],
-  },
-  request_showRecentPrevious: {
-    macKeys: [{ ctrl: true, shift: true, keyCode: keyboardKeys.tab.keyCode }],
-    winLinuxKeys: [{ ctrl: true, shift: true, keyCode: keyboardKeys.tab.keyCode }],
   },
   plugin_reload: {
     macKeys: [{ shift: true, meta: true, keyCode: keyboardKeys.r.keyCode }],
@@ -146,8 +136,8 @@ const defaultRegistry: HotKeyRegistry = {
     ],
   },
   request_showDelete: {
-    macKeys: [{ shift: true, meta: true, keyCode: keyboardKeys.delete.keyCode }],
-    winLinuxKeys: [{ ctrl: true, shift: true, keyCode: keyboardKeys.delete.keyCode }],
+    macKeys: [{ shift: true, meta: true, keyCode: keyboardKeys.backspace.keyCode }],
+    winLinuxKeys: [{ ctrl: true, shift: true, keyCode: keyboardKeys.backspace.keyCode }],
   },
   request_showCreateFolder: {
     macKeys: [{ shift: true, meta: true, keyCode: keyboardKeys.n.keyCode }],

@@ -1,6 +1,6 @@
-import React, { forwardRef, useImperativeHandle, useRef, useState } from 'react';
+import React, { forwardRef, type ReactNode, useImperativeHandle, useRef, useState } from 'react';
 
-import { Modal, type ModalHandle, ModalProps } from '../base/modal';
+import { Modal, type ModalHandle, type ModalProps } from '../base/modal';
 import { ModalBody } from '../base/modal-body';
 import { ModalFooter } from '../base/modal-footer';
 import { ModalHeader } from '../base/modal-header';
@@ -9,7 +9,7 @@ export interface ErrorModalOptions {
   title?: string;
   error?: Error | null;
   addCancel?: boolean;
-  message?: string;
+  message?: string | ReactNode;
 }
 export interface ErrorModalHandle {
   show: (options: ErrorModalOptions) => void;
@@ -39,7 +39,7 @@ export const ErrorModal = forwardRef<ErrorModalHandle, ModalProps>((_, ref) => {
     <Modal ref={modalRef}>
       <ModalHeader>{title || 'Uh Oh!'}</ModalHeader>
       <ModalBody className="wide pad">
-        {message ? <div className="notice error pre">{message}</div> : null}
+        {message ? <div className="notice error pre whitespace-pre-wrap">{message}</div> : null}
         {error && (
           <details>
             <summary>Stack trace</summary>

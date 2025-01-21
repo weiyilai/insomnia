@@ -5,7 +5,6 @@ const {
   TYPESCRIPT_CONVERSION,
   TYPESCRIPT_EXTENSION,
   UNKNOWN,
-  WARN,
 } = require('eslint-config-helpers');
 
 /** @type { import('eslint').Linter.Config } */
@@ -31,7 +30,6 @@ module.exports = {
   plugins: [
     '@typescript-eslint',
     'react',
-    'jest',
     'html',
     'json',
     'filenames',
@@ -53,7 +51,6 @@ module.exports = {
     browser: true,
     commonjs: true,
     es6: true,
-    'jest/globals': true,
     node: true,
   },
   overrides: [
@@ -119,7 +116,7 @@ module.exports = {
     'react/jsx-closing-bracket-location': [ERROR, 'line-aligned'],
     'react/prefer-stateless-function': ERROR,
     'react/jsx-key': [ERROR, { 'checkFragmentShorthand': true }],
-    'react/no-array-index-key': WARN(UNKNOWN),
+    'react/no-array-index-key': ERROR,
     'react/self-closing-comp': ERROR,
 
     'react-hooks/exhaustive-deps': [ERROR, {
@@ -154,5 +151,6 @@ module.exports = {
       property: 'openExternal',
       message: 'use the `window.main.openInBrowser` function instead.  see https://security.stackexchange.com/questions/225799/dangers-of-electrons-shell-openexternal-on-untrusted-content for more information.',
     }],
+    'react/display-name': OFF(UNKNOWN),
   },
 };

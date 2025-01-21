@@ -1,6 +1,6 @@
-import { RENDER_PURPOSE_SEND } from '../common/render';
 import { stats } from '../models';
 import { getBodyBuffer } from '../models/response';
+import { parseGraphQLReqeustBody } from '../utils/graph-ql';
 import { fetchRequestData, responseTransform, sendCurlAndWriteTimeline, tryToInterpolateRequest, tryToTransformRequestWithPlugins } from './network';
 
 export function getSendRequestCallback() {
@@ -12,29 +12,23 @@ export function getSendRequestCallback() {
       settings,
       clientCertificates,
       caCert,
-      activeEnvironmentId } = await fetchRequestData(requestId);
-
-    const renderResult = await tryToInterpolateRequest(request, environment._id, RENDER_PURPOSE_SEND);
+      activeEnvironmentId,
+      timelinePath,
+      responseId,
+    } = await fetchRequestData(requestId);
+    const renderResult = await tryToInterpolateRequest({ request, environment: environment._id, purpose: 'send' });
     const renderedRequest = await tryToTransformRequestWithPlugins(renderResult);
 
     // TODO: remove this temporary hack to support GraphQL variables in the request body properly
-    if (renderedRequest && renderedRequest.body?.text && renderedRequest.body?.mimeType === 'application/graphql') {
-      try {
-        const parsedBody = JSON.parse(renderedRequest.body.text);
-        if (typeof parsedBody.variables === 'string') {
-          parsedBody.variables = JSON.parse(parsedBody.variables);
-          renderedRequest.body.text = JSON.stringify(parsedBody, null, 2);
-        }
-      } catch (e) {
-        console.error('Failed to parse GraphQL variables', e);
-      }
-    }
+    parseGraphQLReqeustBody(renderedRequest);
 
     const response = await sendCurlAndWriteTimeline(
       renderedRequest,
       clientCertificates,
       caCert,
       settings,
+      timelinePath,
+      responseId
     );
     const res = await responseTransform(response, activeEnvironmentId, renderedRequest, renderResult.context);
     const { statusCode: status, statusMessage, headers: headerArray, elapsedTime: responseTime } = res;

@@ -1,11 +1,14 @@
+import * as Sentry from '@sentry/electron/main';
 import {
   app,
   BrowserWindow,
   type BrowserWindow as ElectronBrowserWindow,
   clipboard,
   dialog,
+  ipcMain,
   Menu,
   type MenuItemConstructorOptions,
+  MessageChannelMain,
   screen,
   shell,
 } from 'electron';
@@ -15,7 +18,6 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 
 import {
-  changelogUrl,
   getAppBuildDate,
   getAppVersion,
   getProductName,
@@ -26,7 +28,9 @@ import {
 } from '../common/constants';
 import { docsBase } from '../common/documentation';
 import * as log from '../common/log';
+import { APP_START_TIME, SentryMetrics } from '../common/sentry';
 import { invariant } from '../utils/invariant';
+import { ipcMainOn } from './ipc/electron';
 import LocalStorage from './local-storage';
 
 const DEFAULT_WIDTH = 1280;
@@ -36,6 +40,7 @@ const MINIMUM_HEIGHT = 400;
 
 const browserWindows = new Map<'Insomnia' | 'HiddenBrowserWindow', ElectronBrowserWindow>();
 let localStorage: LocalStorage | null = null;
+let hiddenWindowIsBusy = false;
 
 interface Bounds {
   height?: number;
@@ -47,61 +52,123 @@ interface Bounds {
 export function init() {
   initLocalStorage();
 }
+const stopAndWaitForHiddenBrowserWindow = async (runningHiddenBrowserWindow: BrowserWindow) => {
+  return await new Promise<void>(resolve => {
+    // overwrite the closed handler
+    runningHiddenBrowserWindow.on('closed', () => {
+      console.log('[main] restarting hidden browser window:', runningHiddenBrowserWindow.id);
+      browserWindows.delete('HiddenBrowserWindow');
+      resolve();
+    });
+    stopHiddenBrowserWindow();
+  });
+};
 
-export async function createHiddenBrowserWindow(): Promise<ElectronBrowserWindow> {
-  // if open, close it
-  if (browserWindows.get('HiddenBrowserWindow')) {
-    await new Promise<void>(resolve => {
-      const hiddenBrowserWindow = browserWindows.get('HiddenBrowserWindow');
-      invariant(hiddenBrowserWindow, 'hiddenBrowserWindow is not defined');
+export async function createHiddenBrowserWindow() {
+  const mainWindow = browserWindows.get('Insomnia');
+  invariant(mainWindow, 'MainWindow is not defined, please restart the app.');
 
-      // overwrite the closed handler
-      hiddenBrowserWindow.on('closed', () => {
-        if (hiddenBrowserWindow) {
-          console.log('[main] restarting hidden browser window');
-          browserWindows.delete('HiddenBrowserWindow');
-        }
+  console.log('[main] Registering the hidden window restarting handler');
+  ipcMainOn('set-hidden-window-busy-status', (_, busyStatus) => {
+    hiddenWindowIsBusy = busyStatus;
+  });
+  // this avoids registering handler multiple times and output an error
+  ipcMain.removeHandler('open-channel-to-hidden-browser-window');
+  // when the main window runs a script
+  // if the hidden window is down, start it
+  ipcMain.handle('open-channel-to-hidden-browser-window', async (event, isPortAlive: boolean) => {
+    const runningHiddenBrowserWindow = browserWindows.get('HiddenBrowserWindow');
+    const isRunning = !!runningHiddenBrowserWindow;
+    // if window crashed
+    const windowWasClosedUnexpectedly = hiddenWindowIsBusy && !isRunning;
+    if (windowWasClosedUnexpectedly) {
+      hiddenWindowIsBusy = false;
+    }
+
+    const hiddenWindowIsNotBusy = !hiddenWindowIsBusy;
+    const isHealthy = hiddenWindowIsNotBusy && isRunning && isPortAlive;
+    if (isHealthy) {
+      return;
+    }
+
+    // if window froze
+    const isRunningButUnhealthy = isRunning && !isHealthy;
+    if (isRunningButUnhealthy) {
+      // stop and wait for window close event and sync the map and busy status
+      await stopAndWaitForHiddenBrowserWindow(runningHiddenBrowserWindow);
+    }
+
+    console.log('[main] hidden window is down, restarting');
+    const hiddenBrowserWindow = new BrowserWindow({
+      show: false,
+      title: 'HiddenBrowserWindow',
+      width: DEFAULT_WIDTH,
+      height: DEFAULT_HEIGHT,
+      minHeight: MINIMUM_HEIGHT,
+      minWidth: MINIMUM_WIDTH,
+      webPreferences: {
+        contextIsolation: false,
+        nodeIntegration: true,
+        preload: path.join(__dirname, 'hidden-window-preload.js'),
+        spellcheck: false,
+        devTools: process.env.NODE_ENV === 'development',
+      },
+    });
+
+    hiddenBrowserWindow.on('closed', () => {
+      if (browserWindows.get('HiddenBrowserWindow')) {
+        console.log('[main] closing hidden browser window');
+        browserWindows.delete('HiddenBrowserWindow');
+      }
+    });
+
+    const hiddenBrowserWindowPath = path.resolve(__dirname, 'hidden-window.html');
+    const hiddenBrowserWindowUrl = process.env.HIDDEN_BROWSER_WINDOW_URL || pathToFileURL(hiddenBrowserWindowPath).href;
+    hiddenBrowserWindow.loadURL(hiddenBrowserWindowUrl);
+    console.log(`[main] Loading ${hiddenBrowserWindowUrl}`);
+
+    ipcMain.removeHandler('renderer-listener-ready');
+    const hiddenWinListenerReady = new Promise<void>(resolve => {
+      ipcMain.handleOnce('renderer-listener-ready', () => {
+        console.log('[main] hidden window listener is ready');
         resolve();
       });
-
-      stopHiddenBrowserWindow();
     });
-  }
-  const hiddenBrowserWindow = new BrowserWindow({
-    show: false,
-    title: 'HiddenBrowserWindow',
-    webPreferences: {
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false,
-      webSecurity: true,
-      preload: path.join(__dirname, 'renderers/hidden-browser-window/preload.js'),
-      spellcheck: false,
-    },
+    await hiddenWinListenerReady;
+
+    ipcMain.removeHandler('hidden-window-received-port');
+    const hiddenWinPortReady = new Promise<void>(resolve => {
+      ipcMain.handleOnce('hidden-window-received-port', () => {
+        console.log('[main] hidden window has received port');
+        resolve();
+      });
+    });
+
+    const { port1, port2 } = new MessageChannelMain();
+    hiddenBrowserWindow.webContents.postMessage('renderer-listener', null, [port1]);
+    await hiddenWinPortReady;
+
+    ipcMain.removeHandler('main-window-script-port-ready');
+    const mainWinPortReady = new Promise<void>(resolve => {
+      ipcMain.handleOnce('main-window-script-port-ready', () => {
+        console.log('[main] main window has received hidden window port');
+        resolve();
+      });
+    });
+
+    event.senderFrame?.postMessage('hidden-browser-window-response-listener', null, [port2]);
+    await mainWinPortReady;
+
+    browserWindows.set('HiddenBrowserWindow', hiddenBrowserWindow);
   });
-  browserWindows.set('HiddenBrowserWindow', hiddenBrowserWindow);
-
-  const hiddenBrowserWindowPath = path.resolve(__dirname, './renderers/hidden-browser-window/index.html');
-  const hiddenBrowserWindowUrl = process.env.HIDDEN_BROWSER_WINDOW_URL || pathToFileURL(hiddenBrowserWindowPath).href;
-  hiddenBrowserWindow.loadURL(hiddenBrowserWindowUrl);
-
-  console.log('[main][init hidden win step 1/6]: starting hidden browser window');
-
-  hiddenBrowserWindow.on('closed', () => {
-    if (browserWindows.get('HiddenBrowserWindow')) {
-      console.log('[main] closing hidden browser window');
-      browserWindows.delete('HiddenBrowserWindow');
-    }
-  });
-
-  return hiddenBrowserWindow;
 }
 
 export function stopHiddenBrowserWindow() {
   browserWindows.get('HiddenBrowserWindow')?.close();
+  hiddenWindowIsBusy = false;
 }
 
-export function createWindow(): ElectronBrowserWindow {
+export function createWindow({ firstLaunch }: { firstLaunch?: boolean } = {}): ElectronBrowserWindow {
   const { bounds, fullscreen, maximize } = getBounds();
   const { x, y, width, height } = bounds;
 
@@ -143,6 +210,7 @@ export function createWindow(): ElectronBrowserWindow {
       preload: path.join(__dirname, 'preload.js'),
       zoomFactor: getZoomFactor(),
       nodeIntegration: true,
+      nodeIntegrationInWorker: true,
       webviewTag: true,
       // TODO: enable context isolation
       contextIsolation: false,
@@ -189,6 +257,12 @@ export function createWindow(): ElectronBrowserWindow {
   const appUrl = process.env.APP_RENDER_URL || pathToFileURL(appPath).href;
 
   console.log(`[main] Loading ${appUrl}`);
+  if (firstLaunch) {
+    const duration = performance.now() - APP_START_TIME;
+    Sentry.metrics.distribution(SentryMetrics.MAIN_PROCESS_START_DURATION, duration, {
+      unit: 'millisecond',
+    });
+  }
   mainBrowserWindow.loadURL(appUrl);
   // Emitted when the window is closed.
   mainBrowserWindow.on('closed', () => {
@@ -197,33 +271,29 @@ export function createWindow(): ElectronBrowserWindow {
     }
   });
 
+  mainBrowserWindow.on('focus', () => {
+    console.log('[main] window focus');
+    mainBrowserWindow.webContents.send('mainWindowFocusChange', true);
+  });
+
+  mainBrowserWindow.on('blur', () => {
+    console.log('[main] window blur');
+    mainBrowserWindow.webContents.send('mainWindowFocusChange', false);
+  });
+
   const applicationMenu: MenuItemConstructorOptions = {
     label: `${MNEMONIC_SYM}Application`,
     submenu: [
       {
         label: `${MNEMONIC_SYM}Preferences`,
-        click: function(_menuItem, window) {
-          if (!window || !window.webContents) {
-            return;
-          }
-
-          window.webContents.send('toggle-preferences');
+        click: () => {
+          mainBrowserWindow.webContents?.send('toggle-preferences');
         },
       },
       {
         label: `${MNEMONIC_SYM}Changelog`,
-        click: function(_menuItem, window) {
-          if (!window || !window.webContents) {
-            return;
-          }
-
-          const href = changelogUrl();
-          const { protocol } = new URL(href);
-          if (protocol === 'http:' || protocol === 'https:') {
-            // eslint-disable-next-line no-restricted-properties
-            shell.openExternal(href);
-          }
-        },
+        // eslint-disable-next-line no-restricted-properties
+        click: () => shell.openExternal('https://github.com/Kong/insomnia/releases'),
       },
       {
         type: 'separator',
@@ -414,12 +484,8 @@ export function createWindow(): ElectronBrowserWindow {
       {
         label: `${MNEMONIC_SYM}Keyboard Shortcuts`,
         accelerator: 'CmdOrCtrl+Shift+?',
-        click: (_menuItem, w) => {
-          if (!w || !w.webContents) {
-            return;
-          }
-
-          w.webContents.send('toggle-preferences-shortcuts');
+        click: () => {
+          mainBrowserWindow.webContents.send('toggle-preferences-shortcuts');
         },
       },
       {
@@ -443,10 +509,10 @@ export function createWindow(): ElectronBrowserWindow {
         type: 'separator',
       },
       {
-        label: 'Show Open Source Licenses',
+        label: 'Show Software Bill of Materials',
         click: () => {
-          const licensePath = path.resolve(app.getAppPath(), '../opensource-licenses.txt');
-          shell.openPath(licensePath);
+          // eslint-disable-next-line no-restricted-properties
+          shell.openExternal('https://github.com/Kong/insomnia/releases');
         },
       },
       {
@@ -498,18 +564,32 @@ export function createWindow(): ElectronBrowserWindow {
         click: aboutMenuClickHandler,
       },
       {
+        label: 'Check for updates',
+        click: () => {
+          ipcMain.emit('manualUpdateCheck');
+        },
+      },
+      {
         type: 'separator',
       },
     );
   } else {
     // @ts-expect-error -- TSCONVERSION type splitting
-    helpMenu.submenu?.push({
-      type: 'separator',
-    },
+    helpMenu.submenu?.push(
+      {
+        type: 'separator',
+      },
+      {
+        label: 'Check for updates',
+        click: () => {
+          ipcMain.emit('manualUpdateCheck');
+        },
+      },
       {
         label: `${MNEMONIC_SYM}About`,
         click: aboutMenuClickHandler,
-      });
+      }
+    );
   }
 
   const developerMenu: MenuItemConstructorOptions = {
@@ -529,7 +609,7 @@ export function createWindow(): ElectronBrowserWindow {
       },
       {
         label: `Take ${MNEMONIC_SYM}Screenshot`,
-        click: function() {
+        click: () => {
           // @ts-expect-error -- TSCONVERSION not accounted for in the electron types to provide a function
           mainBrowserWindow.capturePage(image => {
             const buffer = image.toPNG();
@@ -540,14 +620,14 @@ export function createWindow(): ElectronBrowserWindow {
       },
       {
         label: `${MNEMONIC_SYM}Clear a model`,
-        click: function(_menuItem, window) {
-          window?.webContents?.send('clear-model');
+        click: () => {
+          mainBrowserWindow.webContents?.send('clear-model');
         },
       },
       {
         label: `Clear ${MNEMONIC_SYM}all models`,
-        click: function(_menuItem, window) {
-          window?.webContents?.send('clear-all-models');
+        click: () => {
+          mainBrowserWindow.webContents?.send('clear-all-models');
         },
       },
       {
@@ -562,6 +642,21 @@ export function createWindow(): ElectronBrowserWindow {
             height: 1080,
           });
           setZoom(() => 4)();
+        },
+      },
+      {
+        label: 'Show/hide hidden browser window ',
+        click: () => {
+          const hiddenBrowserWindow = browserWindows.get('HiddenBrowserWindow');
+          invariant(hiddenBrowserWindow, 'hiddenBrowserWindow is not defined');
+          hiddenBrowserWindow.isVisible() ? hiddenBrowserWindow.hide() : hiddenBrowserWindow.show();
+        },
+      },
+      {
+        label: 'Stop/start hidden browser window ',
+        click: () => {
+          const hiddenBrowserWindow = browserWindows.get('HiddenBrowserWindow');
+          hiddenBrowserWindow ? stopHiddenBrowserWindow() : createHiddenBrowserWindow();
         },
       },
     ],
@@ -710,6 +805,10 @@ function initLocalStorage() {
   localStorage = new LocalStorage(localStoragePath);
 }
 
-export function getOrCreateWindow() {
-  return browserWindows.get('Insomnia') ?? createWindow();
+export function createWindowsAndReturnMain({ firstLaunch }: { firstLaunch?: boolean } = {}) {
+  const mainWindow = browserWindows.get('Insomnia') ?? createWindow({ firstLaunch });
+  if (!browserWindows.get('HiddenBrowserWindow')) {
+    createHiddenBrowserWindow();
+  }
+  return mainWindow;
 }

@@ -1,12 +1,9 @@
-import { beforeEach, describe, expect, it } from '@jest/globals';
+import { describe, expect, it } from 'vitest';
 
-import { globalBeforeEach } from '../../__jest__/before-each';
 import { urlMatchesCertHost } from '../url-matches-cert-host';
 
 describe('urlMatchesCertHost', () => {
-  beforeEach(globalBeforeEach);
   describe('when the certificate host has no wildcard', () => {
-    beforeEach(globalBeforeEach);
 
     it('should return false if the requested host does not match the certificate host', () => {
       const requestUrl = 'https://www.example.org';
@@ -38,6 +35,18 @@ describe('urlMatchesCertHost', () => {
       expect(urlMatchesCertHost(certificateHost, requestUrl)).toBe(false);
     });
 
+    it('should return true if the request URL and certificate host have different ports and the needCheckPort parameter is false', () => {
+      const requestUrl = 'https://www.example.org:1234/some/resources?query=1';
+      const certificateHost = 'https://www.example.org:123';
+      expect(urlMatchesCertHost(certificateHost, requestUrl, false)).toBe(true);
+    });
+
+    it('should return true if the certificate has the same host and dose not specifies the port, when needCheckPort parameter is false', () => {
+      const requestUrl = 'https://www.example.org:1234/some/resources?query=1';
+      const certificateHost = 'https://www.example.org';
+      expect(urlMatchesCertHost(certificateHost, requestUrl, false)).toBe(true);
+    });
+
     it('should return true if the request URL has a port of 443 and the certificate host has no port', () => {
       const requestUrl = 'https://www.example.org:443/some/resources?query=1';
       const certificateHost = 'https://www.example.org';
@@ -58,8 +67,6 @@ describe('urlMatchesCertHost', () => {
   });
 
   describe('when using wildcard certificate hosts', () => {
-    beforeEach(globalBeforeEach);
-
     it('should return true if the certificate host is only a wildcard', () => {
       const requestUrl = 'https://www.example.org/some/resources?query=1';
       const certificateHost = '*';
@@ -119,11 +126,15 @@ describe('urlMatchesCertHost', () => {
       const certificateHost = '*.example.org';
       expect(urlMatchesCertHost(certificateHost, requestUrl)).toBe(true);
     });
+
+    it('should return true if the certificate URL host match the request host and dose not specifies the port, when needCheckPort parameter is false', () => {
+      const requestUrl = 'https://www.example.org:1234/some/resources?query=1';
+      const certificateHost = 'https://*.example.org';
+      expect(urlMatchesCertHost(certificateHost, requestUrl, false)).toBe(true);
+    });
   });
 
   describe('when an invalid certificate host is supplied', () => {
-    beforeEach(globalBeforeEach);
-
     it('should return false if the certificate host contains invalid characters', () => {
       const requestUrl = 'https://www.example.org/some/resources?query=1';
       const certificateHost = 'https://example!.org';

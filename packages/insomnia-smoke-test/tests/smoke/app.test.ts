@@ -6,15 +6,12 @@ import { test } from '../../playwright/test';
 test('can send requests', async ({ app, page }) => {
   test.slow(process.platform === 'darwin' || process.platform === 'win32', 'Slow app start on these platforms');
   const statusTag = page.locator('[data-testid="response-status-tag"]:visible');
-  const responseBody = page.locator('[data-testid="CodeEditor"]:visible', {
-    has: page.locator('.CodeMirror-activeline'),
-  });
+  const responseBody = page.getByTestId('response-pane');
 
   const text = await loadFixture('smoke-test-collection.yaml');
   await app.evaluate(async ({ clipboard }, text) => clipboard.writeText(text), text);
 
-  await page.getByRole('button', { name: 'Create in project' }).click();
-  await page.getByRole('menuitemradio', { name: 'Import' }).click();
+  await page.getByLabel('Import').click();
   await page.locator('[data-test-id="import-from-clipboard"]').click();
   await page.getByRole('button', { name: 'Scan' }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Import' }).click();
@@ -25,11 +22,11 @@ test('can send requests', async ({ app, page }) => {
   await page.getByText('Which format would you like to export as?').click();
   await page.locator('.app').press('Escape');
 
-  await page.getByText('CollectionSmoke testsjust now').click();
+  await page.getByLabel('Smoke tests').click();
 
   await page.getByLabel('Create in collection').click();
   await page.getByRole('menuitemradio', { name: 'From Curl' }).click();
-  const curl = 'curl --request POST --url https://httpbin.org/status/200';
+  const curl = 'curl --request GET --url https://mock.insomnia.rest';
   await page.locator('.CodeMirror textarea').fill(curl);
   await page.getByRole('dialog').getByRole('button', { name: 'Import' }).click();
 
@@ -47,7 +44,7 @@ test('can send requests', async ({ app, page }) => {
   await page.getByLabel('Request Collection').getByTestId('connects to event stream and shows ping response').press('Enter');
   await page.getByTestId('request-pane').getByRole('button', { name: 'Connect' }).click();
   await expect(statusTag).toContainText('200 OK');
-  await page.getByRole('tab', { name: 'Timeline' }).click();
+  await page.getByRole('tab', { name: 'Console' }).click();
   await expect(responseBody).toContainText('Connected to 127.0.0.1');
   await page.getByTestId('request-pane').getByRole('button', { name: 'Disconnect' }).click();
 
@@ -68,7 +65,7 @@ test('can send requests', async ({ app, page }) => {
   await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
   await expect(statusTag).toContainText('200 OK');
   // TODO(filipe): re-add a check for the preview that is less flaky
-  await page.getByRole('tab', { name: 'Timeline' }).click();
+  await page.getByRole('tab', { name: 'Console' }).click();
   await page.locator('pre').filter({ hasText: '< Content-Type: application/pdf' }).click();
 
   await page.getByLabel('Request Collection').getByTestId('sends request with basic authentication').press('Enter');
@@ -79,23 +76,21 @@ test('can send requests', async ({ app, page }) => {
   await page.getByLabel('Request Collection').getByTestId('sends request with cookie and get cookie in response').press('Enter');
   await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();
   await expect(statusTag).toContainText('200 OK');
-  await page.getByRole('tab', { name: 'Timeline' }).click();
+  await page.getByRole('tab', { name: 'Console' }).click();
   await expect(responseBody).toContainText('Set-Cookie: insomnia-test-cookie=value123');
 });
 
 // This feature is unsafe to place beside other tests, cancelling a request can cause network code to block
 // related to https://linear.app/insomnia/issue/INS-973
 test('can cancel requests', async ({ app, page }) => {
-  await page.getByRole('button', { name: 'Create in project' }).click();
-
   const text = await loadFixture('smoke-test-collection.yaml');
   await app.evaluate(async ({ clipboard }, text) => clipboard.writeText(text), text);
 
-  await page.getByRole('menuitemradio', { name: 'Import' }).click();
+  await page.getByLabel('Import').click();
   await page.locator('[data-test-id="import-from-clipboard"]').click();
   await page.getByRole('button', { name: 'Scan' }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Import' }).click();
-  await page.getByText('CollectionSmoke testsjust now').click();
+  await page.getByLabel('Smoke tests').click();
 
   await page.getByLabel('Request Collection').getByTestId('delayed request').press('Enter');
   await page.getByTestId('request-pane').getByRole('button', { name: 'Send' }).click();

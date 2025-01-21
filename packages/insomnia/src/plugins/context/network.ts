@@ -1,4 +1,4 @@
-import { ExtraRenderInfo, RENDER_PURPOSE_SEND } from '../../common/render';
+import { type ExtraRenderInfo } from '../../common/render';
 import * as models from '../../models';
 import type { Request } from '../../models/request';
 import { fetchRequestData, responseTransform, sendCurlAndWriteTimeline, tryToInterpolateRequest, tryToTransformRequestWithPlugins } from '../../network/network';
@@ -12,15 +12,20 @@ export function init() {
           settings,
           clientCertificates,
           caCert,
-          activeEnvironmentId } = await fetchRequestData(req._id);
+          activeEnvironmentId,
+          timelinePath,
+          responseId,
+        } = await fetchRequestData(req._id);
 
-        const renderResult = await tryToInterpolateRequest(request, environment._id, RENDER_PURPOSE_SEND, extraInfo);
+        const renderResult = await tryToInterpolateRequest({ request, environment: environment._id, purpose: 'send', extraInfo });
         const renderedRequest = await tryToTransformRequestWithPlugins(renderResult);
         const response = await sendCurlAndWriteTimeline(
           renderedRequest,
           clientCertificates,
           caCert,
           settings,
+          timelinePath,
+          responseId
         );
         const responsePatch = await responseTransform(response, activeEnvironmentId, renderedRequest, renderResult.context);
         return models.response.create(responsePatch, settings.maxHistoryResponses);
